@@ -1,0 +1,4 @@
+- [ ] Build shared BitTrace command-deck shell and synthetic data service
+- [ ] Add dashboard with charts, KPIs, prioritized leads, and entity drill-down
+- [ ] Add ingestion, explorer/detail, graph, anomaly, clusters, alerts, geo, reports, and settings views
+- [ ] Add route metadata and verify desktop/mobile preview interactions
