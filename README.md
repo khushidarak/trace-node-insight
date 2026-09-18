@@ -1,1386 +1,347 @@
-# BitTrace Investigator
+# BitTrace AI
+
+**AI-Powered Bitcoin Transaction Traffic Monitoring & Analysis**
+
+A complete, offline forensic investigation platform built for **Smart India Hackathon 2026 — Problem Statement SIH26146** (Organisation: National Technical Research Organisation · Category: Software · Theme: Cryptocurrency).
+
+BitTrace AI ingests bulk Bitcoin transaction/network metadata, correlates network-layer observations (IP/port/timing) with blockchain-layer data (wallet/TXID/amount), applies AI/ML to detect anomalies, clusters related entities, and produces **prioritized, explainable investigative leads** — all rendered in a SOC-style investigation console.
+
+> ⚠️ BitTrace AI is a blockchain-forensics and network-traffic-analysis tool — **not** a crypto price tracker or trading app. It reports *investigation leads*, never verdicts: every score is an investigative prioritization signal that requires human review.
+
+---
+
+## Table of Contents
+
+1. [Features](#features)
+2. [Architecture](#architecture)
+3. [Tech Stack](#tech-stack)
+4. [Quick Start](#quick-start)
+5. [Backend API Reference](#backend-api-reference)
+6. [ML Pipeline](#ml-pipeline)
+7. [Dataset & Schema](#dataset--schema)
+8. [Project Structure](#project-structure)
+9. [Demo Flow](#demo-flow)
+10. [Testing](#testing)
+11. [Design Principles & Limitations](#design-principles--limitations)
+12. [Roadmap](#roadmap)
+
+---
+
+## Features
+
+### 🔍 Investigation Console (React + TanStack Start)
+
+| View | What it does |
+| --- | --- |
+| **Dashboard** | KPI cards (transactions, wallets, IPs, suspicious entities, high-risk alerts, avg anomaly score), activity-over-time chart, risk-distribution donut, model reason-code bars, top suspicious entities table |
+| **Data Ingestion** | Drag-and-drop upload for CSV/JSON/XML (20 MB limit), live schema-validated dataset summary, sample-dataset download, processing pipeline visualization |
+| **Transaction Explorer** | Searchable/filterable transaction table (risk, country, ASN, free text across TXID/wallet/IP/ASN), click-through investigation drawer |
+| **Transaction Detail** | Flow diagram (source → TX → destination), full metadata grid, **"Why was this flagged?"** panel with per-feature contribution bars |
+| **Entity Graph** | Force-directed link-analysis canvas: wallets (blue circles), transactions (orange squares), IPs (yellow diamonds), ASN nodes. Node size ∝ connectivity, risk halos on flagged nodes, type filters, click-to-inspect |
+| **Entity Investigation** | Risk score, anomaly score, connected-entity table, AI risk explanation, one-click "Open in Graph" |
+| **AI Anomaly Detection** | Model card (Isolation Forest, unsupervised), all engineered features, risk-band scale, entity score distribution |
+| **Entity Clusters** | DBSCAN candidate groups with wallet/IP/transaction counts, risk level, behavioural signature, member countries |
+| **Investigation Alerts** | Prioritized lead table sorted by risk/confidence, full status workflow (New → Investigating → Reviewed → Dismissed), evidence drawer with linked TXIDs/IPs |
+| **Geo Network** | Country-level IP/transaction/wallet associations with risk context and the explicit note that *a country is never suspicious* |
+| **Reports** | Investigation report generation + working exports: **PDF** (print-formatted case file), **JSON** (machine-readable), **CSV** (transaction record set) |
+| **Global Search** | Categorized results: Transactions, Wallets, IP Addresses, Alerts, Clusters |
+
+### ⚙️ Backend Intelligence (FastAPI + scikit-learn)
+
+- **Format-agnostic ingestion** — CSV, JSON, XML with field aliasing (`country` → `geo_country`, `tx_id` → `txid`, …), flexible timestamps (ISO 8601 / epoch seconds / milliseconds / common formats), list fields as arrays or delimited strings. Malformed rows are rejected with a count, never crashing the pipeline.
+- **Real ML, not static rules** — Isolation Forest anomaly detection over 31 engineered features, DBSCAN entity clustering, networkx graph construction with multi-round risk propagation.
+- **Explainability by default** — every alert ships per-feature contribution scores (robust z-scores × model deviation), rendered as "why" bars in the UI.
+- **Backend-optional resilience** — the frontend auto-detects the backend and falls back to bundled mock data, so the demo never breaks.
+
+---
+
+## Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  FRONTEND — React 19 · TypeScript · TanStack Start · Tailwind v4   │
+│  SOC-dark console · Recharts · SVG force-directed graph            │
+│  Service layer: src/lib/api.ts (backend probe + mock fallback)     │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               │  REST/JSON  (auto-detected)
+┌──────────────────────────────▼─────────────────────────────────────┐
+│  BACKEND — FastAPI (backend/app/main.py)                           │
+│  In-process state: one dataset + one analysis per session          │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼─────────────────────────────────────┐
+│  ML PIPELINE (backend/app/pipeline.py)                             │
+│                                                                    │
+│  CSV/JSON/XML → ingestion.py (validate, alias, reject)             │
+│       ↓                                                            │
+│  Feature engineering (13 tx · 11 wallet · 7 IP features)           │
+│       ↓                                                            │
+│  Isolation Forest (200 trees, contamination 0.08)                  │
+│       ↓  scores normalised to 0.00–1.00                            │
+│  DBSCAN entity clustering (wallet behaviour space)                 │
+│       ↓                                                            │
+│  Graph construction (networkx: IP↔TX↔Wallet edges)                 │
+│       ↓                                                            │
+│  Risk propagation (3 rounds, keep-weight 0.70)                     │
+│       ↓                                                            │
+│  Explainable risk scoring → prioritized alerts (capped at 60)      │
+│       ↓                                                            │
+│  Dashboard · Explorer · Graph · Clusters · Geo · Reports           │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Intended production evolution** (per the problem statement): this prototype's pipeline maps 1:1 onto a Pandas/scikit-learn batch service; the REST contract below is stable, so the mock/UI layer needs no redesign when the backend scales up.
+
+---
+
+## Tech Stack
+
+| Layer | Technologies |
+| --- | --- |
+| Frontend | React 19, TypeScript (strict), TanStack Start + React Router + React Query, Tailwind CSS v4, shadcn/ui (Radix), Recharts, Lucide icons, IBM Plex Mono + Space Grotesk |
+| Backend | Python 3.9+, FastAPI, Uvicorn, python-multipart |
+| ML / Data | pandas, NumPy, scikit-learn (Isolation Forest, DBSCAN, StandardScaler), networkx |
+| Build | Vite 8, Nitro, ESLint 9 + Prettier |
 
-Build a professional, hackathon-ready offline Bitcoin Transaction Traffic Monitoring & Analysis platform for an investigation/forensics use case.
+---
 
-1. Product Name
+## Quick Start
 
-BitTrace AI
+### Prerequisites
 
-Tagline:
-AI-Powered Bitcoin Transaction Traffic Monitoring & Analysis
+- **Node.js 20+** and npm
+- **Python 3.9+** (3.11+ recommended)
 
-The application should look like a serious cybersecurity / blockchain-forensics investigation platform, NOT a crypto trading website.
-
-2. Core Objective
-
-Build a complete prototype that ingests a synthetic Bitcoin transaction/network metadata dataset and:
-
-Ingests CSV / JSON / XML files
-
-Parses Bitcoin transaction and network metadata
-
-Correlates:
-
-IP addresses
-
-Ports
-
-timestamps
-
-TXIDs
-
-wallet addresses
-
-input/output addresses
-
-transaction amounts
-
-fees
-
-script types
-
-country / ASN
-
-Creates an interactive entity/transaction graph
-
-Uses AI/ML to detect suspicious/anomalous activity
-
-Clusters related wallets/entities
-
-Generates prioritized investigation alerts
-
-Provides explainable reasons for every alert
-
-Shows a confidence/anomaly score
-
-Provides a dashboard for investigators
-
-The prototype must work with local synthetic data and should be designed so that the ML backend can later be connected to a Python/FastAPI service.
-
-3. Important Requirement
-
-This is NOT a cryptocurrency price tracker.
-
-Do NOT include:
-
-Bitcoin price charts
-
-trading functionality
-
-buy/sell buttons
-
-exchange UI
-
-portfolio tracking
-
-wallet investment features
-
-The application is specifically for:
-
-Blockchain forensics + network traffic analysis + anomaly detection + entity investigation.
-
-4. Overall UI
-
-Create a dark cybersecurity dashboard.
-
-Visual style:
-
-Dark navy/black background
-
-Professional SOC/cybersecurity aesthetic
-
-Blue/cyan accent colors
-
-Red/orange for high-risk alerts
-
-Green for low-risk/normal activity
-
-Glass/modern cards
-
-Subtle borders
-
-Clean typography
-
-Minimal animations
-
-Dense but readable investigative information
-
-The application should feel similar to:
-
-Security Operations Center dashboard
-
-Digital forensics platform
-
-Link-analysis investigation software
-
-Do NOT make it look like a gaming dashboard.
-
-5. Main Navigation
-
-Create a left sidebar with:
-
-BITTRACE AI
-
-Navigation:
-
-Dashboard
-
-Data Ingestion
-
-Transaction Explorer
-
-Entity Graph
-
-AI Anomaly Detection
-
-Entity Clusters
-
-Investigation Alerts
-
-Geo Network
-
-Reports
-
-Settings
-
-At the bottom show:
-
-SYSTEM STATUS
-● Offline Analysis Mode
-
-6. DASHBOARD
-
-Create an investigator-focused dashboard.
-
-Top KPI cards:
-
-Total Transactions
-
-Example:
-24,581
-
-Wallet Entities
-
-Example:
-8,942
-
-Network IPs
-
-Example:
-3,216
-
-Suspicious Entities
-
-Example:
-184
-
-High-Risk Alerts
-
-Example:
-37
-
-Average Anomaly Score
-
-Example:
-0.67
-
-Add a small label:
-
-Synthetic Dataset
-
-Dashboard Charts
-
-A. Transaction Activity Over Time
-
-Interactive line/area chart showing:
-
-Normal transactions
-
-Suspicious transactions
-
-X-axis:
-Timestamp
-
-Y-axis:
-Transaction count
-
-B. Risk Distribution
-
-Donut chart:
-
-Low
-
-Medium
-
-High
-
-Critical
-
-C. Suspicious Activity Types
-
-Bar chart:
-
-Rapid wallet movement
-
-Unusual transaction amount
-
-High-degree wallet
-
-IP-wallet correlation anomaly
-
-Layering pattern
-
-Entity cluster anomaly
-
-Geographic anomaly
-
-D. Top Suspicious Entities
-
-Table:
-
-Entity
-
-Type
-
-Risk
-
-Score
-
-Reason
-
-wallet_1
-
-Wallet
-
-Critical
-
-0.96
-
-Rapid fund movement
-
-wallet_2
-
-Wallet
-
-High
-
-0.89
-
-Unusual transaction pattern
-
-IP_23
-
-IP
-
-High
-
-0.86
-
-Linked to multiple wallets
-
-Clicking a row should open the investigation view.
-
-7. DATA INGESTION PAGE
-
-Create a large drag-and-drop upload area.
-
-Title:
-
-Import Investigation Dataset
-
-Supported formats:
-
-CSV
-
-JSON
-
-XML
-
-Show:
-
-Offline processing — files remain on the local system
-
-After upload, show:
-
-Dataset Summary
-
-File name
-
-File type
-
-Number of records
-
-Number of wallets
-
-Number of transactions
-
-Number of IP addresses
-
-Date range
-
-Then show a preview table.
-
-Expected fields:
-
-timestamp
-src_ip
-dst_ip
-src_port
-dst_port
-txid
-input_addresses
-output_addresses
-input_amounts
-output_amounts
-fee
-script_type
-geo_country
-asn
-
-Add:
-
-
-
-Run Analysis
-
-
-
-button.
-
-
-
-When clicked, show a processing pipeline:
-
-Dataset Loaded
-      ↓
-Schema Validation
-      ↓
-Data Cleaning
-      ↓
-Transaction Parsing
-      ↓
-IP ↔ Wallet Correlation
-      ↓
-Feature Engineering
-      ↓
-ML Anomaly Detection
-      ↓
-Entity Clustering
-      ↓
-Explainable Risk Scoring
-      ↓
-Investigation Alerts
-
-8. TRANSACTION EXPLORER
-
-Create a searchable transaction table.
-
-Columns:
-
-TXID
-
-Timestamp
-
-Input Wallets
-
-Output Wallets
-
-Input Amount
-
-Output Amount
-
-Fee
-
-Source IP
-
-Destination IP
-
-Country
-
-ASN
-
-Risk Score
-
-Status
-
-Allow filtering by:
-
-Risk
-
-Country
-
-ASN
-
-Amount
-
-Date
-
-IP
-
-Wallet
-
-Script type
-
-Clicking a TXID opens a detailed transaction page.
-
-9. TRANSACTION DETAIL
-
-Create a professional investigation page.
-
-Header:
-
-Transaction Investigation
-
-Display:
-
-TXID
-
-Timestamp
-
-Risk Score
-
-Risk Level
-
-Transaction Flow
-
-Create a visual flow:
-
-SOURCE WALLET
-     ↓
-TRANSACTION
-     ↓
-DESTINATION WALLET
-
-Show:
-
-Input addresses
-
-Output addresses
-
-Input amount
-
-Output amount
-
-Fee
-
-Script type
-
-Network Information
-
-Show:
-
-Source IP
-Destination IP
-Source Port
-Destination Port
-Country
-ASN
-
-AI Explanation
-
-Create a card:
-
-Why was this transaction flagged?
-
-Example:
-
-High anomaly score because the transaction shows unusually rapid fund movement, connects to multiple wallet entities, and deviates significantly from the normal transaction amount distribution.
-
-Show feature contributions:
-
-Rapid fund movement        +0.24
-Wallet connectivity        +0.21
-Amount anomaly             +0.18
-IP correlation             +0.13
-Geographic deviation       +0.09
-
-Use horizontal bars.
-
-10. ENTITY GRAPH
-
-This is one of the most important pages.
-
-Create a large interactive graph visualization.
-
-Nodes:
-
-Wallet
-
-Blue circular node
-
-Transaction
-
-Purple square node
-
-IP
-
-Orange node
-
-ASN
-
-Green node
-
-Edges:
-
-Wallet → Transaction
-
-Transaction → Wallet
-
-IP → Transaction
-
-IP → Wallet
-
-IP → ASN
-
-Example:
-
-       IP
-       |
-       |
-     TX123
-    /     \
-Wallet A  Wallet B
-    |
-   TX456
-    |
-Wallet C
-
-Node size should depend on connectivity.
-
-Suspicious nodes should visually stand out.
-
-Clicking a node should open an investigation side panel.
-
-11. ENTITY INVESTIGATION PANEL
-
-When clicking a wallet:
-
-Show:
-
-Wallet Information
-
-Wallet ID / Address
-
-Risk Score
-
-Risk Level
-
-First Seen
-
-Last Seen
-
-Transaction Count
-
-Incoming Volume
-
-Outgoing Volume
-
-Connected IPs
-
-Connected Wallets
-
-Connected Transactions
-
-AI Risk Explanation
-
-Example:
-
-Risk Score: 91/100
-
-Reasons:
-
-Connected to 27 wallet entities
-
-Unusual outgoing transaction frequency
-
-High transaction-volume deviation
-
-Associated with multiple network endpoints
-
-Strong similarity with suspicious entity cluster
-
-Connected Entities
-
-Show a small table:
-
-Entity
-
-Type
-
-Connections
-
-Risk
-
-IP-192
-
-IP
-
-12
-
-High
-
-Wallet-B
-
-Wallet
-
-8
-
-Medium
-
-TX-918
-
-Transaction
-
-1
-
-High
-
-12. AI ANOMALY DETECTION
-
-Create a dedicated ML analysis page.
-
-Header:
-
-AI-Powered Anomaly Detection
-
-Explain:
-
-Machine learning identifies transaction and entity behavior that deviates from learned normal patterns. The system combines transaction, network, temporal and graph-derived features to prioritize investigative leads.
-
-Show model information:
-
-Model
-
-Isolation Forest
-
-Purpose:
-
-Unsupervised anomaly detection
-
-Because the provided dataset is synthetic and does not necessarily contain reliable labels.
-
-Feature Engineering
-
-Display features used by the model:
-
-Transaction amount
-
-Fee ratio
-
-Input/output count
-
-Transaction frequency
-
-Time between transactions
-
-Wallet degree
-
-IP degree
-
-Number of connected wallets
-
-Number of connected IPs
-
-Geographic diversity
-
-ASN diversity
-
-Incoming/outgoing volume
-
-Burst activity
-
-Repeated IP-wallet relationships
-
-Model Output
-
-Create an anomaly score from:
-
-0.00 → 1.00
-
-Risk mapping:
-
-0.00–0.39   Low
-0.40–0.69   Medium
-0.70–0.89   High
-0.90–1.00   Critical
-
-Make it clear that this is an investigative prioritization score, not proof of criminal activity.
-
-13. ENTITY CLUSTERING
-
-Create a page:
-
-Suspicious Entity Clusters
-
-Use clustering visualization.
-
-Example clusters:
-
-Cluster #01
-23 wallets
-8 IPs
-41 transactions
-Risk: High
-
-Cluster #02
-17 wallets
-5 IPs
-29 transactions
-Risk: Medium
-
-Possible algorithm:
-
-DBSCAN
-
-Features can include:
-
-transaction behavior
-
-connectivity
-
-transaction frequency
-
-amount patterns
-
-IP relationships
-
-Show each cluster as a card.
-
-Clicking a cluster opens its graph.
-
-14. INVESTIGATION ALERTS
-
-Create the main alert-management page.
-
-Header:
-
-Prioritized Investigation Leads
-
-Table:
-
-Priority
-
-Entity
-
-Type
-
-Risk
-
-Confidence
-
-Detection Reason
-
-Status
-
-Example:
-
-CRITICAL
-Wallet A
-Wallet
-0.94
-0.92
-Unusual transaction burst + high graph connectivity
-New
-
-Statuses:
-
-New
-
-Investigating
-
-Reviewed
-
-Dismissed
-
-Allow sorting by:
-
-Risk
-
-Confidence
-
-Timestamp
-
-Entity type
-
-15. EXPLAINABLE ALERT DETAILS
-
-Clicking an alert opens a right-side investigation drawer.
-
-Show:
-
-Alert
-
-Suspicious Wallet Entity
-
-Confidence
-
-92%
-
-Anomaly Score
-
-94%
-
-Detection Factors
-
-Transaction burst
-
-High wallet connectivity
-
-Unusual amount pattern
-
-Multiple IP associations
-
-Geographic diversity
-
-Show an explanation:
-
-The entity was prioritized because its observed behavior differs substantially from the learned baseline. The strongest contributing signals were transaction frequency, graph connectivity and transaction amount deviation.
-
-Then show:
-
-Evidence
-
-TXIDs
-
-timestamps
-
-wallet addresses
-
-IP addresses
-
-transaction amounts
-
-linked entities
-
-Add:
-
-Open in Graph
-
-button.
-
-16. GEO NETWORK
-
-Create a geographic visualization.
-
-Use country-level visualization rather than precise real-world user tracking.
-
-Show:
-
-Country
-
-Number of IPs
-
-Number of transactions
-
-Number of wallet associations
-
-Risk level
-
-Example:
-
-India       1,240 IPs
-US            842 IPs
-Germany       321 IPs
-Singapore     184 IPs
-
-Add filters:
-
-Country
-
-Risk
-
-Date
-
-ASN
-
-Do not imply that a country itself is suspicious.
-
-17. REPORTS
-
-Create a report generation page.
-
-Show:
-
-Generate Investigation Report
-
-Report should include:
-
-Dataset summary
-
-Analysis period
-
-Total transactions
-
-Wallet entities
-
-IP entities
-
-Suspicious entities
-
-Alert statistics
-
-Top investigation leads
-
-Graph relationships
-
-AI model used
-
-Feature explanations
-
-Limitations
-
-Buttons:
-
-Export PDF
-
-Export JSON
-
-Export CSV
-
-18. BACKEND-READY ARCHITECTURE
-
-Build the frontend so it can later communicate with a Python FastAPI backend.
-
-Create a clean API service layer.
-
-Expected endpoints:
-
-POST /api/upload
-POST /api/analyze
-GET  /api/dashboard
-GET  /api/transactions
-GET  /api/transactions/{txid}
-GET  /api/entities
-GET  /api/entities/{id}
-GET  /api/graph
-GET  /api/alerts
-GET  /api/clusters
-GET  /api/geo
-GET  /api/reports
-
-For the initial prototype, use realistic mock data if the backend is not connected.
-
-Keep the API service layer separate so mock data can later be replaced with FastAPI endpoints without redesigning the UI.
-
-19. DATA MODEL
-
-Use these conceptual entities:
-
-Transaction
-
-txid
-timestamp
-input_addresses
-output_addresses
-input_amounts
-output_amounts
-fee
-script_type
-
-Network Observation
-
-timestamp
-src_ip
-dst_ip
-src_port
-dst_port
-txid
-
-Geographic Metadata
-
-ip
-country
-asn
-
-Entity
-
-id
-type
-risk_score
-anomaly_score
-connections
-
-Alert
-
-id
-entity_id
-entity_type
-risk_level
-confidence
-anomaly_score
-reasons
-evidence
-timestamp
-status
-
-20. MOCK DATA
-
-Generate realistic synthetic mock data for the UI.
-
-At minimum create:
-
-500+ transactions
-
-200+ wallets
-
-100+ IP addresses
-
-Multiple countries
-
-Multiple ASNs
-
-Normal and anomalous behavior
-
-Wallet clusters
-
-IP-wallet relationships
-
-High-frequency transaction bursts
-
-Unusual transaction amounts
-
-Clearly label all mock information:
-
-SYNTHETIC DATA
-
-Do not use real criminal identities or real seized Bitcoin data.
-
-21. IMPORTANT ML DESIGN
-
-The frontend should represent a real ML pipeline rather than pretending that static rules are AI.
-
-The intended backend architecture is:
-
-CSV / JSON / XML
-       ↓
-Pandas
-       ↓
-Data Cleaning
-       ↓
-Feature Engineering
-       ↓
-Isolation Forest
-       ↓
-DBSCAN / Entity Clustering
-       ↓
-Graph Construction
-       ↓
-Risk Scoring
-       ↓
-Explainability
-       ↓
-Dashboard
-
-For explainability, show feature contributions / reason codes generated from the model features.
-
-The UI should never claim:
-
-“this wallet is definitely criminal.”
-
-Instead use language such as:
-
-Suspicious pattern
-
-Anomalous behavior
-
-Investigation lead
-
-Elevated risk
-
-Requires review
-
-AI-prioritized entity
-
-22. SEARCH
-
-Add a global search bar.
-
-Placeholder:
-
-Search TXID, wallet, IP, ASN…
-
-Search results should categorize matches:
-
-Transactions
-Wallets
-IP Addresses
-Clusters
-Alerts
-
-23. INTERACTION REQUIREMENTS
-
-Make the prototype highly interactive.
-
-Required interactions:
-
-Upload dataset
-
-Run analysis
-
-Search TXID/wallet/IP
-
-Filter alerts
-
-Sort alerts
-
-Click transaction
-
-Click wallet
-
-Click IP
-
-Expand investigation details
-
-Explore graph
-
-Open connected entities
-
-Filter graph
-
-Change date range
-
-View alert evidence
-
-Generate report
-
-Use smooth transitions but keep the application professional.
-
-24. EMPTY / LOADING STATES
-
-Create professional states.
-
-Before dataset upload:
-
-No investigation dataset loaded
-
-“Upload a CSV, JSON or XML dataset to begin offline analysis.”
-
-During analysis:
-
-Running AI Analysis…
-
-Show the processing pipeline with progress.
-
-After analysis:
-
-Analysis Complete
-
-“24,581 records processed successfully.”
-
-25. SECURITY / PRIVACY
-
-Add a small footer:
-
-Offline Analysis Mode • Synthetic Dataset • No Live Blockchain Monitoring
-
-Do not include external wallet tracking or live blockchain APIs in the prototype.
-
-The purpose is offline analysis of provided datasets.
-
-26. TECH STACK
-
-Use:
-
-Frontend:
-
-React
-
-TypeScript
-
-Tailwind CSS
-
-Recharts
-
-Lucide icons
-
-For graph visualization use a suitable React graph library such as:
-
-React Flow
-OR
-
-Cytoscape.js
-
-Use reusable components and clean folder structure.
-
-Prepare the frontend for:
-
-React → FastAPI → Python ML pipeline
-
-27. DESIGN DETAILS
-
-Use responsive desktop-first layout.
-
-The main dashboard should have:
-
-Left:
-Sidebar
-
-Top:
-Search + system status + profile/settings
-
-Center:
-KPIs + charts
-
-Bottom:
-Suspicious entities + investigation alerts
-
-Use cards with enough padding.
-
-Do not overcrowd cards with paragraphs.
-
-Use:
-
-short labels
-
-numbers
-
-badges
-
-icons
-
-charts
-
-tables
-
-expandable panels
-
-28. DEMO FLOW
-
-The complete demo should work like this:
-
-Step 1
-
-User opens BitTrace AI.
-
-Step 2
-
-Dashboard displays:
-
-No dataset loaded
-
-Step 3
-
-User opens Data Ingestion.
-
-Step 4
-
-Uploads:
-
-bitcoin_network_metadata.csv
-
-Step 5
-
-System validates the schema.
-
-Step 6
-
-User clicks:
-
-Run AI Analysis
-
-Step 7
-
-Show processing pipeline.
-
-Step 8
-
-Dashboard becomes populated.
-
-Step 9
-
-User sees:
-
-transaction statistics
-
-anomaly statistics
-
-suspicious entities
-
-clusters
-
-geographic relationships
-
-Step 10
-
-User clicks a high-risk alert.
-
-Step 11
-
-Investigation panel shows:
-
-entity
-
-risk score
-
-confidence
-
-explanation
-
-evidence
-
-connected transactions
-
-connected IPs
-
-Step 12
-
-User clicks:
-
-Open in Graph
-
-Step 13
-
-Interactive graph shows:
-
-IP → Transaction → Wallet → Transaction → Wallet
-
-This should be the main “wow” moment of the prototype.
-
-29. FINAL QUALITY REQUIREMENT
-
-Make this look like a real cybersecurity investigation product suitable for a national-level hackathon demonstration.
-
-Prioritize:
-
-Working data ingestion UI
-
-AI anomaly detection visualization
-
-Explainable alerts
-
-Interactive entity graph
-
-Transaction investigation
-
-Entity clustering
-
-Clean dashboard
-
-Backend-ready architecture
-
-The application should demonstrate the complete story:
-
-Raw Metadata → Correlation → AI/ML → Graph → Anomaly → Explainable Alert → Investigation Lead
-
-Do not build only a static dashboard. Build a believable end-to-end prototype experience.
-
-This project was built with [Lovable](https://lovable.dev).
-
-## Build with Lovable
-
-Continue developing this project in the [Lovable editor](https://lovable.dev/projects/2a729198-3161-43ef-8548-78e4c666c0a2).
-
-- **Ship faster**: describe what you want to build and Lovable handles the code.
-- **Stay in sync**: every change made in Lovable is committed straight to this repository.
-- **Full ownership**: this code is yours. Push to `main` on GitHub and your changes sync back into Lovable, ready for your next prompt.
-
-## Development
-
-Prefer working locally? You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating).
+### One command (frontend + backend together)
 
 ```sh
-git clone <this-repository-url>
-cd <repository-name>
-npm i
-npm run dev
+./dev.sh
 ```
+
+First run creates the Python venv and installs everything automatically. Then:
+
+- Frontend → http://localhost:8080
+- Backend → http://localhost:8000
+- The sidebar footer will show **"FastAPI backend · live"** when connected.
+
+### Manual setup
+
+```sh
+# 1. Frontend dependencies
+npm install
+
+# 2. Backend virtualenv
+python3 -m venv backend/.venv
+backend/.venv/bin/pip install -r backend/requirements.txt
+
+# 3. Run (two terminals)
+npm run backend        # FastAPI on :8000
+npm run dev            # Vite on :8080
+```
+
+### Frontend without the backend
+
+`npm run dev` alone works — the app runs in **mock mode** with bundled synthetic data (badge: "mock mode"). Every feature stays functional; the graph is seeded from the highest-risk mock transactions instead of live pipeline output.
+
+> **Configuration:** the backend URL defaults to `http://localhost:8000`. Override with `VITE_API_URL=http://host:port npm run dev`.
+
+---
+
+## Backend API Reference
+
+Base URL: `http://localhost:8000`
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Service status, dataset/analysis flags |
+| `POST` | `/api/upload` | Ingest CSV/JSON/XML (`multipart/form-data`, field `file`) |
+| `POST` | `/api/analyze` | Run the full ML pipeline on the loaded dataset |
+| `GET` | `/api/dashboard` | KPIs, activity series, risk distribution, top entities |
+| `GET` | `/api/dashboard-full` | Complete analysis payload in one response |
+| `GET` | `/api/transactions` | Search (`q`), filter (`risk`, `country`, `asn`), paginate (`limit`, `offset`) |
+| `GET` | `/api/transactions/{txid}` | Single transaction with contribution detail |
+| `GET` | `/api/entities` | Scored wallets/IPs (`type`, `q`, `limit`, `offset`) |
+| `GET` | `/api/entities/{id}` | Single entity with evidence + neighbours |
+| `GET` | `/api/graph` | Nodes + edges for link analysis (`limit`) |
+| `GET` | `/api/alerts` | Prioritized leads (`status`, `risk` filters) |
+| `PATCH` | `/api/alerts/{id}?status=` | Status workflow: `New` / `Investigating` / `Reviewed` / `Dismissed` |
+| `GET` | `/api/clusters` | DBSCAN entity clusters |
+| `GET` | `/api/geo` | Country-level network context |
+| `GET` | `/api/reports` | Report payload (summary, alert stats, top leads, limitations) |
+| `GET` | `/api/sample-dataset?records=N` | Download synthetic dataset CSV (100–20,000 records) |
+
+Error semantics: `409` when analyzing without a dataset · `422` for unparseable uploads · `404` for unknown TXIDs/entities/alerts.
+
+---
+
+## ML Pipeline
+
+### Risk bands
+
+| Score | Level |
+| --- | --- |
+| 0.00 – 0.39 | 🟢 Low |
+| 0.40 – 0.69 | 🟡 Medium |
+| 0.70 – 0.89 | 🟠 High |
+| 0.90 – 1.00 | 🔴 Critical |
+
+Scores are percentile-normalised with a linear remap so the bulk of normal activity lands in the Low band; only genuinely extreme behaviour reaches High/Critical.
+
+### Engineered features
+
+- **Transaction (13)** — amount mean/max, fee ratio, I/O ratio, input/output counts, burst score (share of <5-minute-arrival transactions), wallet degree, IP degree, country/ASN diversity, repeated IP↔wallet pairs, off-peak-hour flag
+- **Wallet (11)** — degree, in/out volume, transaction frequency, IP partners, wallet co-participants (via shared TXIDs), burst score, amount std/max, off-peak ratio, cluster-risk reserve
+- **IP (7)** — wallet partners, transaction count, volume, country diversity, ASN concentration, burst score, fan-out degree
+
+### Models
+
+- **Isolation Forest** — unsupervised (the dataset carries no reliable labels), 200 trees, contamination 0.08. Chosen because it isolates anomalies by random partitioning rather than modelling "normal" explicitly — well suited to sparse, high-dimensional behavioural features.
+- **DBSCAN** — density clustering over standardised wallet features; ε=1.15, min_samples=4. Finds laundering groups *and* labels noise (isolated wallets) without fixing the cluster count upfront.
+- **Risk propagation** — seed scores diffuse 3 rounds across the transaction graph (70 % own score / 30 % neighbourhood mean), so a wallet connected to flagged entities is elevated — surfacing downstream exposure that single-entity scoring misses.
+- **Alert blending** — final lead score = 0.6 × entity score + 0.4 × propagated score; only High/Critical become leads, capped at 60 so the list stays investigable.
+
+### Explainability
+
+Every flagged entity stores its **top-5 feature contributions** — per-feature robust z-scores weighted by the model's anomaly deviation. These render as the horizontal "why" bars in the transaction drawer and as the detection factors in alert evidence. Reason codes are human-readable (`burst_score`, `asn_concentration`, `wallet_partners`, …).
+
+### Why this is honest ML
+
+- No labels are invented; detection is genuinely unsupervised
+- The UI never claims criminality — wording everywhere is "suspicious pattern", "requires review", "investigation lead"
+- Limitations are printed in every generated report
+
+---
+
+## Dataset & Schema
+
+The problem statement mandates **synthetic data** (no real seized or live-intercept data). Two options:
+
+**1. Generate one (recommended for demos):**
+```sh
+curl "http://localhost:8000/api/sample-dataset?records=2000" -o bitcoin_network_metadata.csv
+# …or click "Sample dataset" on the Data Ingestion page
+```
+The generator (`backend/app/synthetic.py`) injects known laundering behaviours — peeling chains (4–8 hops), transaction bursts, layering hubs (6–12 fan-out), CoinJoin-style equal outputs, and geographic anomalies — so the ML pipeline has real structure to find (~10 % anomalous rows).
+
+**2. Bring your own** CSV/JSON/XML with the required fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `timestamp` | datetime | ISO 8601, epoch s/ms, or common formats |
+| `src_ip` / `dst_ip` | string | network-layer endpoints |
+| `src_port` / `dst_port` | int | |
+| `txid` | string | transaction identifier |
+| `input_addresses[]` / `output_addresses[]` | list | wallet addresses |
+| `input_amounts[]` / `output_amounts[]` | list[float] | aligned with the address lists |
+| `fee` | float | |
+| `script_type` | string | P2WPKH, P2SH, P2TR, … |
+| `geo_country` / `asn` | string | geographic/ASN metadata |
+
+Lists may arrive as JSON arrays or `;`/`,`-delimited strings; common field aliases are auto-mapped; rows failing validation are counted and skipped (the upload response reports `rejectedRecords` and any `missingFields`).
+
+---
+
+## Project Structure
+
+```
+├── dev.sh                      # one-command launcher (backend + frontend)
+├── package.json                # frontend scripts & dependencies
+├── src/
+│   ├── components/
+│   │   ├── bittrace/
+│   │   │   └── BitTraceApp.tsx # full console: shell + all 10 views
+│   │   └── ui/                 # shadcn/ui primitives
+│   ├── lib/
+│   │   ├── api.ts              # service layer: backend probe, mock fallback
+│   │   ├── bittrace-api.ts     # types + bundled synthetic mock data
+│   │   └── utils.ts
+│   ├── routes/                 # TanStack Start file routes
+│   └── styles.css              # SOC-dark design tokens (Tailwind v4 theme)
+├── backend/
+│   ├── requirements.txt
+│   ├── app/
+│   │   ├── main.py             # FastAPI endpoints + analysis orchestration
+│   │   ├── pipeline.py         # features · Isolation Forest · DBSCAN · graph · alerts
+│   │   ├── ingestion.py        # CSV/JSON/XML parsing, aliases, validation
+│   │   ├── synthetic.py        # synthetic dataset generator
+│   │   └── config.py           # all tunables (thresholds, seeds, limits)
+│   └── tests/
+│       ├── test_pipeline.py    # end-to-end pipeline smoke test
+│       ├── api_smoke.sh        # full HTTP contract test (boots server)
+│       └── api_edge.sh         # 409/422 guards, JSON + XML ingestion
+└── .freebuff/run.md            # sandbox/preview run procedures
+```
+
+---
+
+## Demo Flow
+
+The end-to-end story: **Raw Metadata → Correlation → AI/ML → Graph → Explainable Alert → Investigation Lead**
+
+1. Open BitTrace AI — dashboard shows the empty state
+2. **Data Ingestion** → click **Sample dataset** (downloads `bitcoin_network_metadata.csv`)
+3. Drop the file into the upload zone — schema summary populates
+4. Click **Run AI Analysis** — the 10-stage processing pipeline animates
+5. Dashboard fills with live KPIs, charts, and top suspicious entities
+6. **Entity Graph** — explore the force-directed canvas; click any node
+7. Click a high-risk alert in **Investigation Alerts** → evidence drawer (confidence, detection factors, linked TXIDs/IPs)
+8. **Open in Graph** — the flagged entity's neighbourhood lights up
+9. **Reports** → Generate → export the case file as PDF/JSON/CSV
+
+With the backend running, everything above reflects genuine Isolation Forest + DBSCAN + risk-propagation output (~330+ node graph from a 1,000-record dataset).
+
+---
+
+## Testing
+
+```sh
+# Backend pipeline (synthetic data → full analysis payload)
+cd backend && .venv/bin/python tests/test_pipeline.py
+
+# Full HTTP contract (boots its own server, hits every endpoint)
+backend/tests/api_smoke.sh
+
+# Edge cases: 409 guard, JSON/XML uploads, malformed-file 422
+backend/tests/api_edge.sh
+
+# Frontend
+npx tsc --noEmit     # strict typecheck
+npm run lint         # ESLint + Prettier
+npm run build        # production build
+```
+
+---
+
+## Design Principles & Limitations
+
+**Principles**
+- Offline-first: no live blockchain APIs, no external wallet tracking; files never leave the local system
+- Investigative language only — the system flags patterns, humans decide
+- Explainability is a first-class output, not an afterthought
+- Country-level context, never country-level accusation
+
+**Known limitations (stated in every report)**
+- Scores are prioritization signals, **not** proof of criminal activity
+- Synthetic dataset — demonstrates the pipeline, not real-world calibrated rates
+- Unsupervised models may flag rare-but-benign behaviour for review
+- In-process state: one dataset/analysis per backend session (persistence is roadmap work)
+
+---
+
+## Roadmap
+
+- [ ] Persist datasets, analyses, and alert statuses (SQLite) across restarts
+- [ ] peeling-chain / CoinJoin pattern detectors as first-class reason codes with sequence visualization
+- [ ] GeoIP database integration (offline MaxMind) for precise ASN/country enrichment
+- [ ] Graph zoom, pan, and node dragging; alert-aware neighbourhood focus
+- [ ] Multi-dataset sessions with dataset comparison views
+- [ ] Dockerized one-command deployment
+- [ ] Export formats: STIX/TAXII for intel-sharing interoperability
+
+---
+
+## Team & Acknowledgements
+
+Built for **Smart India Hackathon 2026** (SIH26146). Thanks to the open-source communities behind FastAPI, scikit-learn, networkx, React, TanStack, and Tailwind CSS.
+
+*BitTrace AI — Offline Analysis Mode · Synthetic Dataset · No Live Blockchain Monitoring*

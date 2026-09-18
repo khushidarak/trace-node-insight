@@ -78,10 +78,18 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "BitTrace AI — Bitcoin Forensics Console" },
-      { name: "description", content: "Offline Bitcoin transaction traffic monitoring, anomaly detection, graph analysis, and explainable investigation leads." },
+      {
+        name: "description",
+        content:
+          "Offline Bitcoin transaction traffic monitoring, anomaly detection, graph analysis, and explainable investigation leads.",
+      },
       { name: "author", content: "BitTrace AI" },
       { property: "og:title", content: "BitTrace AI — Bitcoin Forensics Console" },
-      { property: "og:description", content: "Offline Bitcoin transaction traffic monitoring, anomaly detection, graph analysis, and explainable investigation leads." },
+      {
+        property: "og:description",
+        content:
+          "Offline Bitcoin transaction traffic monitoring, anomaly detection, graph analysis, and explainable investigation leads.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
       { name: "twitter:site", content: "@Lovable" },
@@ -93,7 +101,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
       { rel: "preconnect", href: "https://fonts.googleapis.com" },
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
-      { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" },
+      {
+        rel: "stylesheet",
+        href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap",
+      },
       { rel: "icon", href: "/favicon.ico", type: "image/x-icon" },
     ],
   }),
