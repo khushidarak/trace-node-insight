@@ -133,11 +133,13 @@ def build_wallet_features(df: pd.DataFrame) -> pd.DataFrame:
         df, ["output_addresses", "output_amounts", "timestamp", "src_ip", "txid"],
         ["output_addresses", "output_amounts"],
     )
+
     wallets = sorted(set(exploded_in["input_addresses"].dropna()) | set(exploded_out["output_addresses"].dropna()))
     feats = pd.DataFrame(index=pd.Series(wallets, name="wallet"))
 
     in_g = exploded_in.groupby("input_addresses")
     out_g = exploded_out.groupby("output_addresses")
+
     feats["degree"] = in_g.size().add(out_g.size(), fill_value=0).fillna(0.0).astype(float)
     feats["in_volume"] = pd.to_numeric(in_g["input_amounts"].sum(), errors="coerce").fillna(0.0)
     feats["out_volume"] = pd.to_numeric(out_g["output_amounts"].sum(), errors="coerce").fillna(0.0)
@@ -145,23 +147,28 @@ def build_wallet_features(df: pd.DataFrame) -> pd.DataFrame:
     feats["ip_partners"] = in_g["src_ip"].nunique().add(
         out_g["src_ip"].nunique(), fill_value=0
     ).reindex(feats.index).fillna(0.0).astype(float)
-    # Wallet co-participants: distinct wallets seen on the other side of shared txs.
-    pairs = exploded_in[["input_addresses", "txid"]].merge(
-        exploded_out[["output_addresses", "txid"]], on="txid"
-    )
-    partners = pd.concat([
-        pairs.groupby("input_addresses")["output_addresses"].nunique(),
-        pairs.groupby("output_addresses")["input_addresses"].nunique(),
-    ]).groupby(level=0).sum()
-    feats["wallet_partners"] = partners.reindex(feats.index).fillna(0.0).astype(float)
+
+    # OPTIMIZED PARTNER COUNTING (Avoids full dataframe cross-join)
+    # Estimate distinct partners per txid without giant merges
+    tx_in_counts = exploded_in.groupby("txid")["input_addresses"].nunique()
+    tx_out_counts = exploded_out.groupby("txid")["output_addresses"].nunique()
+    
+    in_partners = exploded_in.set_index("txid")["input_addresses"].map(tx_out_counts).groupby(exploded_in["input_addresses"]).sum()
+    out_partners = exploded_out.set_index("txid")["output_addresses"].map(tx_in_counts).groupby(exploded_out["output_addresses"]).sum()
+    
+    feats["wallet_partners"] = in_partners.add(out_partners, fill_value=0).reindex(feats.index).fillna(0.0).astype(float)
+
     feats["burst_score"] = exploded_in.groupby("input_addresses")["timestamp"].apply(_burst_scores).reindex(feats.index).fillna(0.0).astype(float)
-    feats["amount_std"] = out_g["output_amounts"].std().reindex(feats.index).fillna(0.0).astype(float)
-    feats["amount_max"] = out_g["output_amounts"].max().reindex(feats.index).fillna(0.0).astype(float)
+    feats["amount_std"] = out_g["output_amounts"].std().reindex(feats.index).fillna(0.0)
+    feats["amount_max"] = out_g["output_amounts"].max().reindex(feats.index).fillna(0.0)
+
     out_ts = exploded_out.copy()
     out_ts["hour"] = pd.to_datetime(out_ts["timestamp"], utc=True).dt.hour
     offpeak = out_ts.assign(offpeak=((out_ts["hour"] >= 1) & (out_ts["hour"] <= 5)).astype(float))
-    feats["peak_hour_ratio"] = offpeak.groupby("output_addresses")["offpeak"].mean().reindex(feats.index).fillna(0.0).astype(float)
-    feats["cluster_risk"] = 0.0  # reserved: filled by graph risk propagation
+    feats["peak_hour_ratio"] = offpeak.groupby("output_addresses")["offpeak"].mean().reindex(feats.index).fillna(0.0)
+    feats["cluster_risk"] = 0.0
+
+    return feats
     return feats.fillna(0.0)
 
 
