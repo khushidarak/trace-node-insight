@@ -1,174 +1,162 @@
-"""Dataset ingestion: CSV / JSON / XML → canonical records.
-
-Accepts uploads matching the SIH26146 field contract. Records that fail
-validation are counted and excluded rather than crashing the pipeline; field
-aliases (e.g. `timestamp` vs `time`) are normalised transparently.
-"""
+"""Dataset ingestion: CSV / JSON / XML → normalized Bitcoin transaction rows."""
 
 from __future__ import annotations
 
 import csv
 import io
 import json
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
-from .config import MAX_UPLOAD_BYTES, REQUIRED_FIELDS
+from .config import MAX_UPLOAD_BYTES
 
-# Aliases accepted for each canonical field so differently-named exports parse.
+CANONICAL_FIELDS = (
+    "timestamp", "src_ip", "src_port", "dst_ip", "dst_port", "txid",
+    "input_wallet", "output_wallet", "amount", "fee", "script_type",
+)
 ALIASES: dict[str, tuple[str, ...]] = {
-    "timestamp": ("timestamp", "time", "ts", "date_time"),
-    "src_ip": ("src_ip", "source_ip", "srcip"),
-    "dst_ip": ("dst_ip", "dest_ip", "destination_ip", "dstip"),
-    "src_port": ("src_port", "source_port"),
-    "dst_port": ("dst_port", "dest_port", "destination_port"),
-    "txid": ("txid", "tx_id", "transaction_id"),
-    "input_addresses": ("input_addresses", "input_address", "inputs", "vin_addresses"),
-    "output_addresses": ("output_addresses", "output_address", "outputs", "vout_addresses"),
-    "input_amounts": ("input_amounts", "input_amount", "input_values"),
-    "output_amounts": ("output_amounts", "output_amount", "output_values"),
-    "fee": ("fee", "tx_fee", "fee_sat"),
-    "script_type": ("script_type", "scripttype", "scriptPubKey_type"),
-    "geo_country": ("geo_country", "country", "geoip_country"),
-    "asn": ("asn", "autonomous_system", "asn_number"),
+    "timestamp": ("timestamp", "time", "datetime", "date", "block_time", "ts", "date_time"),
+    "src_ip": ("src_ip", "source_ip", "sourceip", "source_address", "srcip"),
+    "src_port": ("src_port", "source_port", "sourceport"),
+    "dst_ip": ("dst_ip", "destination_ip", "destinationip", "dest_ip", "destip"),
+    "dst_port": ("dst_port", "destination_port", "destinationport", "dest_port"),
+    "txid": ("txid", "transaction_id", "transaction_hash", "tx_hash", "tx_id"),
+    "input_wallet": ("input_wallet", "input_address", "sender_wallet", "source_wallet", "input_addresses", "inputs"),
+    "output_wallet": ("output_wallet", "output_address", "receiver_wallet", "destination_wallet", "output_addresses", "outputs"),
+    "amount": ("amount", "value", "btc_amount", "transaction_amount", "input_amount", "output_amount"),
+    "fee": ("fee", "transaction_fee", "tx_fee", "fee_sat"),
+    "script_type": ("script", "script_type", "script_type_name", "scripttype", "scriptpubkey_type"),
 }
+_ALIAS_LOOKUP = {
+    re.sub(r"[^a-z0-9]", "", alias.lower()): canonical
+    for canonical, aliases in ALIASES.items()
+    for alias in aliases
+}
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc).isoformat()
 
 
 class IngestionError(ValueError):
-    """Raised when a dataset cannot be parsed at all."""
-
-
-def _canonical(field: str) -> str:
-    return field.strip().lower().replace(" ", "_")
+    """Raised when a dataset cannot be parsed or has no usable transaction rows."""
 
 
 def _match(field: str) -> str | None:
-    c = _canonical(field)
-    for canonical, names in ALIASES.items():
-        if c in names:
-            return canonical
-    return None
-
-
-def _to_float_list(value: object) -> list[float]:
-    if value is None or value == "":
-        return []
-    if isinstance(value, (int, float)):
-        return [float(value)]
-    if isinstance(value, str):
-        value = value.strip().strip("[]")
-        parts = [p for p in value.replace(";", ",").split(",") if p.strip()]
-        return [float(p) for p in parts]
-    if isinstance(value, (list, tuple)):
-        out: list[float] = []
-        for item in value:
-            out.extend(_to_float_list(item))
-        return out
-    raise ValueError(f"cannot interpret {value!r} as numeric list")
-
-
-def _to_str_list(value: object) -> list[str]:
-    if value is None or value == "":
-        return []
-    if isinstance(value, str):
-        value = value.strip().strip("[]")
-        parts = [p for p in value.replace(";", ",").split(",") if p.strip()]
-        return [p.strip() for p in parts]
-    if isinstance(value, (list, tuple)):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return [str(value)]
+    return _ALIAS_LOOKUP.get(re.sub(r"[^a-z0-9]", "", field.strip().lower()))
 
 
 def _parse_timestamp(value: object) -> str:
     if isinstance(value, (int, float)):
-        # Heuristic: > 1e11 means milliseconds.
         seconds = value / 1000 if value > 1e11 else value
         return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
     text = str(value).strip()
+    if not text:
+        raise ValueError("empty timestamp")
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M"):
             try:
-                dt = datetime.strptime(text, fmt)
+                parsed = datetime.strptime(text, fmt)
                 break
             except ValueError:
                 continue
         else:
             raise ValueError(f"unparseable timestamp {value!r}") from None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def _to_list(value: object) -> list[object]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if item is not None and str(item).strip()]
+    if isinstance(value, dict):
+        return _to_list(value.get("address", value.get("value", "")))
+    if isinstance(value, str):
+        text = value.strip().strip("[]")
+        if not text:
+            return []
+        parts = text.replace(";", ",").split(",")
+        return [part.strip().strip("\"'") for part in parts if part.strip()]
+    return [value]
 
 
 def _normalise(raw: dict) -> dict | None:
-    row: dict = {}
-    seen: dict[str, str] = {}
+    seen: dict[str, object] = {}
     for key, value in raw.items():
-        if key is None:
-            continue
         canonical = _match(str(key))
-        if canonical:
+        if canonical and value is not None and str(value).strip():
             seen[canonical] = value
-    missing = [f for f in REQUIRED_FIELDS if f not in seen]
-    if missing:
+
+    txid = str(seen.get("txid", "")).strip()
+    inputs = [str(item).strip() for item in _to_list(seen.get("input_wallet")) if str(item).strip()]
+    outputs = [str(item).strip() for item in _to_list(seen.get("output_wallet")) if str(item).strip()]
+    # A transaction ID and at least one wallet side are the minimum useful link.
+    if not txid or not (inputs or outputs):
         return None
 
     try:
-        row["timestamp"] = _parse_timestamp(seen["timestamp"])
-    except ValueError:
+        timestamp = _parse_timestamp(seen["timestamp"]) if "timestamp" in seen else _EPOCH
+        amount_values = _to_list(seen.get("amount"))
+        amounts = [float(value) for value in amount_values]
+        amount = amounts[0] if amounts else 0.0
+        fee = float(seen.get("fee") or 0)
+        src_port = int(float(seen["src_port"])) if seen.get("src_port") not in (None, "") else None
+        dst_port = int(float(seen["dst_port"])) if seen.get("dst_port") not in (None, "") else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
-    for field in ("src_ip", "dst_ip", "txid", "script_type", "geo_country", "asn"):
-        row[field] = str(seen[field]).strip()
-    for field in ("src_port", "dst_port"):
-        try:
-            row[field] = int(float(seen[field]))
-        except (TypeError, ValueError):
-            row[field] = 0
-    try:
-        fee = float(seen["fee"])
-    except (TypeError, ValueError):
-        return None
-    row["fee"] = fee
+    src_ip = str(seen["src_ip"]).strip() if seen.get("src_ip") is not None else None
+    dst_ip = str(seen["dst_ip"]).strip() if seen.get("dst_ip") is not None else None
+    script_type = str(seen["script_type"]).strip() if seen.get("script_type") is not None else None
+    input_wallet = inputs[0] if inputs else None
+    output_wallet = outputs[0] if outputs else None
 
-    try:
-        row["input_addresses"] = _to_str_list(seen["input_addresses"])
-        row["output_addresses"] = _to_str_list(seen["output_addresses"])
-        row["input_amounts"] = _to_float_list(seen["input_amounts"])
-        row["output_amounts"] = _to_float_list(seen["output_amounts"])
-    except (TypeError, ValueError):
-        return None
+    # Keep the compact canonical record and compatibility fields consumed by the ML pipeline.
+    return {
+        "timestamp": timestamp,
+        "src_ip": src_ip,
+        "src_port": src_port,
+        "dst_ip": dst_ip,
+        "dst_port": dst_port,
+        "txid": txid,
+        "input_wallet": input_wallet,
+        "output_wallet": output_wallet,
+        "amount": amount,
+        "fee": fee,
+        "script_type": script_type,
+        "input_addresses": inputs,
+        "output_addresses": outputs,
+        "input_amounts": amounts[:len(inputs)] or ([amount] if inputs else []),
+        "output_amounts": amounts[:len(outputs)] or ([amount] if outputs else []),
+        "geo_country": "Unknown",
+        "asn": "Unknown",
+    }
 
-    if not row["txid"] or not row["input_addresses"] or not row["output_addresses"]:
-        return None
-    return row
 
-
-def parse_records(raw_rows: list[dict]) -> tuple[list[dict], int, list[str]]:
-    """Normalise raw dict rows → (records, rejected_count, missing_field_report)."""
+def parse_records(raw_rows: list[dict]) -> tuple[list[dict], int, list[str], list[str]]:
     records: list[dict] = []
     rejected = 0
+    detected: list[str] = []
     for raw in raw_rows:
         if not isinstance(raw, dict):
             rejected += 1
             continue
+        for key in raw:
+            if key is not None and str(key) not in detected:
+                detected.append(str(key))
         row = _normalise(raw)
         if row is None:
             rejected += 1
         else:
             records.append(row)
-    present = set()
-    for raw in raw_rows[:50]:
-        if isinstance(raw, dict):
-            for key in raw:
-                matched = _match(str(key))
-                if matched:
-                    present.add(matched)
-    missing_report = sorted(set(REQUIRED_FIELDS) - present)
-    return records, rejected, missing_report
+    present = {_match(name) for name in detected}
+    missing = sorted(set(CANONICAL_FIELDS) - present)
+    return records, rejected, missing, detected
 
 
 def parse_csv(text: str) -> list[dict]:
@@ -176,16 +164,19 @@ def parse_csv(text: str) -> list[dict]:
 
 
 def parse_json(text: str) -> list[dict]:
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise IngestionError(f"Invalid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno}).") from exc
     if isinstance(data, dict):
         for key in ("data", "records", "transactions", "rows"):
             if isinstance(data.get(key), list):
                 data = data[key]
                 break
         else:
-            raise IngestionError("JSON object must contain a data/records/transactions array")
+            raise IngestionError("Unsupported JSON schema: expected an array or a data/records/transactions/rows array.")
     if not isinstance(data, list):
-        raise IngestionError("JSON must be an array of records")
+        raise IngestionError("Unsupported JSON schema: expected an array of transaction records.")
     return data
 
 
@@ -193,48 +184,56 @@ def parse_xml(text: str) -> list[dict]:
     try:
         root = ET.fromstring(text)
     except ET.ParseError as exc:
-        raise IngestionError(f"invalid XML: {exc}") from exc
+        raise IngestionError(f"Invalid XML: {exc}.") from exc
 
-    def flatten(el: ET.Element) -> dict:
-        row: dict = {}
-        row.update(el.attrib)
-        for child in el:
-            tag = child.tag
-            if len(child) == 0 and not child.attrib:
-                row[tag] = child.text
-            elif all(grand.tag == "address" for grand in child) and child.tag.endswith("addresses"):
-                row[tag] = [g.text for g in child]
+    def local(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def flatten(element: ET.Element) -> dict:
+        result = {local(key): value for key, value in element.attrib.items()}
+        for child in element:
+            key = local(child.tag)
+            value: object = child.text.strip() if child.text and child.text.strip() else None
+            if list(child):
+                value = flatten(child)
+                # Accept common address/value wrappers used for transaction inputs/outputs.
+                if isinstance(value, dict) and len(value) == 1:
+                    value = next(iter(value.values()))
+            if key in result:
+                previous = result[key] if isinstance(result[key], list) else [result[key]]
+                result[key] = previous + ([value] if not isinstance(value, list) else value)
             else:
-                row[tag] = flatten(child)
-        return row
+                result[key] = value
+        return result
 
-    candidates = [root] + list(root)
-    rows_el = None
-    for cand in candidates:
-        children = list(cand)
-        if children and all(ch.tag in {"row", "record", "transaction"} for ch in children):
-            rows_el = children
-            break
-    if rows_el is None:
-        raise IngestionError("XML must contain <rows><row>…</row></rows> structure")
-    return [flatten(el) for el in rows_el]
+    record_tags = {"row", "record", "transaction", "tx"}
+    candidates = [child for child in root if local(child.tag).lower() in record_tags]
+    if not candidates and local(root.tag).lower() in record_tags:
+        candidates = [root]
+    if not candidates:
+        raise IngestionError("Unsupported XML schema: expected <rows><row>, <transactions><transaction>, or transaction records.")
+    return [flatten(element) for element in candidates]
 
 
-def load_upload(filename: str, payload: bytes) -> tuple[list[dict], int, list[str], str]:
-    """Route an uploaded file to the right parser. Returns (records, rejected, missing, file_type)."""
+def load_upload(filename: str, payload: bytes) -> tuple[list[dict], int, list[str], str, list[str], int]:
     if len(payload) > MAX_UPLOAD_BYTES:
-        raise IngestionError(f"file exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit")
+        raise IngestionError(f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.")
     lower = filename.lower()
     text = payload.decode("utf-8-sig", errors="replace")
     if lower.endswith(".json"):
         raw_rows, file_type = parse_json(text), "json"
     elif lower.endswith(".xml"):
         raw_rows, file_type = parse_xml(text), "xml"
-    else:
+    elif lower.endswith(".csv"):
         raw_rows, file_type = parse_csv(text), "csv"
-    records, rejected, missing = parse_records(raw_rows)
+    else:
+        raise IngestionError("Unsupported file type. Upload a CSV, JSON, or XML transaction dataset.")
+    records, rejected, missing, detected = parse_records(raw_rows)
     if not records:
+        columns = ", ".join(detected) if detected else "none detected"
         raise IngestionError(
-            "no valid records found — check required fields: " + ", ".join(REQUIRED_FIELDS)
+            "Unsupported transaction schema: no valid rows found. Each record needs a transaction ID "
+            "(txid / transaction_id / transaction_hash) and at least one input or output wallet. "
+            f"Detected columns: {columns}."
         )
-    return records, rejected, missing, file_type
+    return records, rejected, missing, file_type, detected, len(raw_rows)

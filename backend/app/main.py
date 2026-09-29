@@ -69,7 +69,19 @@ def _require_analysis() -> dict:
 # Pipeline runner
 # ---------------------------------------------------------------------------
 def run_full_analysis(records: list[dict], meta: dict) -> dict:
-    df = pd.DataFrame(records)
+    df = pd.DataFrame(records).copy()
+    # Network metadata is optional in uploaded transaction datasets. Keep the
+    # normalized upload nullable, but use an explicit bucket for ML grouping.
+    for field in ("src_ip", "dst_ip", "geo_country", "asn", "script_type"):
+        if field not in df:
+            df[field] = "Unknown"
+        else:
+            df[field] = df[field].fillna("Unknown").replace("", "Unknown")
+    for field in ("src_port", "dst_port"):
+        if field not in df:
+            df[field] = 0
+        else:
+            df[field] = df[field].fillna(0)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
     # 1. Transaction-level scoring
@@ -296,7 +308,9 @@ def health():
 async def upload(file: UploadFile = File(...)):
     payload = await file.read()
     try:
-        records, rejected, missing, file_type = load_upload(file.filename or "dataset.csv", payload)
+        records, rejected, missing, file_type, detected, total_records = load_upload(
+            file.filename or "dataset.csv", payload
+        )
     except IngestionError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -308,18 +322,31 @@ async def upload(file: UploadFile = File(...)):
     for r in records:
         wallets.update(r["input_addresses"])
         wallets.update(r["output_addresses"])
-        ips.add(r["src_ip"])
-        ips.add(r["dst_ip"])
+        ips.update(ip for ip in (r["src_ip"], r["dst_ip"]) if ip)
     STATE["meta"] = {
         "fileName": file.filename,
         "fileType": file_type,
         "records": len(records),
+        "totalRecords": total_records,
+        "validRecords": len(records),
         "wallets": len(wallets),
         "transactions": len({r["txid"] for r in records}),
         "ips": len(ips),
         "dateRange": [min(timestamps), max(timestamps)],
         "rejectedRecords": rejected,
         "missingFields": missing,
+        "detectedColumns": detected,
+        "normalizedColumns": [
+            "timestamp", "src_ip", "src_port", "dst_ip", "dst_port", "txid",
+            "input_wallet", "output_wallet", "amount", "fee", "script_type",
+        ],
+        "sampleRecords": [
+            {key: row.get(key) for key in (
+                "timestamp", "src_ip", "src_port", "dst_ip", "dst_port", "txid",
+                "input_wallet", "output_wallet", "amount", "fee", "script_type",
+            )}
+            for row in records[:3]
+        ],
     }
     return {"status": "ingested", **STATE["meta"]}
 
