@@ -328,7 +328,7 @@ async def upload(file: UploadFile = File(...)):
         wallets.update(r["input_addresses"])
         wallets.update(r["output_addresses"])
         ips.update(ip for ip in (r["src_ip"], r["dst_ip"]) if ip)
-        
+         
     STATE["meta"] = {
         "fileName": file.filename,
         "fileType": file_type,
@@ -354,16 +354,16 @@ async def upload(file: UploadFile = File(...)):
             for row in records[:3]
         ],
     }
-
-    # CRITICAL FIX: Offload CPU-bound ML pipeline execution to a threadpool
-    analysis = await run_in_threadpool(run_full_analysis, STATE["dataset"], STATE["meta"])
-    STATE["analysis"] = analysis
+    
+    # Reset analysis state until /api/analyze is explicitly called by the frontend
+    STATE["analysis"] = None
 
     return {
         "status": "ingested", 
         "summary": STATE["meta"],
-        "analysisReady": True
+        "analysisReady": False
     }
+
 
 @app.post("/api/analyze")
 def analyze():
