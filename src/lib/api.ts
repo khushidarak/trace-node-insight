@@ -27,7 +27,7 @@ import {
 
 export const BACKEND_URL: string =
   (import.meta.env as Record<string, string | undefined>)?.["VITE_API_URL"] ??
-  "http://localhost:8000";
+  "https://trace-node-insight.onrender.com";;
 
 export interface DatasetMeta {
   fileName: string;
@@ -91,11 +91,17 @@ export interface ReportPayload {
 
 /** Probe whether the FastAPI backend answers within `timeoutMs`. Cached. */
 let backendProbe: Promise<boolean> | null = null;
-export function isBackendAvailable(timeoutMs = 1500): Promise<boolean> {
+export function isBackendAvailable(timeoutMs = 60000): Promise<boolean> {
   if (!backendProbe) {
     backendProbe = fetch(`${BACKEND_URL}/api/health`, { signal: AbortSignal.timeout(timeoutMs) })
-      .then((res) => res.ok)
-      .catch(() => false);
+           .then((res) => {
+        if (!res.ok) backendProbe = null;
+        return res.ok;
+      })
+      .catch(() => {
+        backendProbe = null;
+        return false;
+      });
   }
   return backendProbe;
 }
