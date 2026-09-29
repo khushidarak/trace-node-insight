@@ -538,12 +538,9 @@ def sample_dataset(records: int = 1200):
         headers={"Content-Disposition": "attachment; filename=bitcoin_network_metadata.csv"},
     )
 
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-import os
 
-app = FastAPI()
+
+
 
 # --- Keep all your existing API routes here ---
 # app.include_router(...)
