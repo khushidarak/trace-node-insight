@@ -545,16 +545,22 @@ import os
 
 app = FastAPI()
 
-# --- (Your existing API router endpoints stay here) ---
+# --- Keep all your existing API routes here ---
+# app.include_router(...)
 
-# --- Serve Static Frontend Files ---
-static_path = os.path.join(os.path.dirname(__file__), "../../static")
-if os.path.exists(static_path):
-    app.mount("/assets", StaticFiles(directory=os.path.join(static_path, "assets")), name="assets")
+# --- Add this at the bottom for local frontend serving ---
+static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../static"))
 
+if os.path.exists(static_dir):
+    # Mount asset folder if it exists
+    assets_dir = os.path.join(static_dir, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    # Serve index.html for root and SPA client routes
     @app.get("/{full_path:path}")
-    async def serve_frontend(full_path: str):
-        file_path = os.path.join(static_path, full_path)
+    async def serve_react_app(full_path: str):
+        file_path = os.path.join(static_dir, full_path)
         if os.path.exists(file_path) and os.path.isfile(file_path):
             return FileResponse(file_path)
-        return FileResponse(os.path.join(static_path, "index.html"))
+        return FileResponse(os.path.join(static_dir, "index.html"))
