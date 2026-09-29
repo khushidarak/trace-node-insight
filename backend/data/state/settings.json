@@ -1,0 +1,10 @@
+{
+  "contamination": 0.08,
+  "risk_propagation_decay": 0.7,
+  "peeling_min_hops": 4,
+  "mixing_min_outputs": 5,
+  "dbscan_eps": 1.15,
+  "dbscan_min_samples": 4,
+  "risk_high_threshold": 0.7,
+  "risk_critical_threshold": 0.9
+}

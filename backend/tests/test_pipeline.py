@@ -1,42 +1,63 @@
-"""End-to-end pipeline smoke test: synthetic data → full analysis payload."""
+"""End-to-end pipeline test: synthetic generator → full analysis payload."""
 
+from __future__ import annotations
+
+import os
 import sys
 
-from app.main import run_full_analysis
-from app.synthetic import generate_synthetic_dataset
+from generate_data import Generator
+from pipeline import ingest
 
-rows = generate_synthetic_dataset(400)
-meta = {
-    "fileName": "synthetic_test.csv",
-    "fileType": "csv",
-    "records": len(rows),
-    "wallets": 0,
-    "transactions": len(rows),
-    "ips": 0,
-    "dateRange": [rows[0]["timestamp"], rows[-1]["timestamp"]],
-    "rejectedRecords": 0,
-    "missingFields": [],
-}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-analysis = run_full_analysis(rows, meta)
+from app.orchestrator import run_analysis, summarize_dataset  # noqa: E402
 
-print("kpis:", analysis["kpis"])
-print("alerts:", len(analysis["alerts"]), "| clusters:", len(analysis["clusters"]),
-      "| entities:", len(analysis["entities"]), "| graph nodes:", len(analysis["graph"]["nodes"]))
-print("sample alert:", analysis["alerts"][0] if analysis["alerts"] else None)
-print("sample cluster:", analysis["clusters"][0] if analysis["clusters"] else None)
-print("geo rows:", len(analysis["geo"]), "| activity days:", len(analysis["activity"]))
 
-issues = []
-if not analysis["alerts"]:
-    issues.append("no alerts generated")
-if analysis["kpis"]["suspiciousEntities"] == 0:
-    issues.append("no suspicious entities")
-if not analysis["clusters"]:
-    issues.append("no clusters found")
-if not analysis["graph"]["nodes"]:
-    issues.append("empty graph")
-if issues:
-    print("ISSUES:", issues)
-    sys.exit(1)
-print("PIPELINE SMOKE TEST PASSED")
+def _analysis(rows: int = 3000):
+    gen = Generator(rows=rows, seed=42)
+    raw, labels, planted = gen.generate()
+    for rec, label in zip(raw, labels):
+        rec["ground_truth"] = label
+    records, reasons = ingest.parse_records(raw)
+    meta = summarize_dataset(records, reasons, "test", "synthetic", ingest.detected_fields(raw[:50]))
+    meta["planted_patterns"] = planted
+    return run_analysis(records, meta)
+
+
+def test_generator_plants_ground_truth():
+    gen = Generator(rows=2000, seed=7)
+    raw, labels, planted = gen.generate()
+    assert len(raw) == len(labels) == 2000
+    assert sum(labels) > 0, "expected illicit rows"
+    assert any(k.startswith("chain_ID_") for k in planted)
+    assert any(k.startswith("ID_CJ-") for k in planted)
+    assert planted.get("seed_wallets")
+
+
+def test_full_analysis_payload_shape():
+    analysis = _analysis()
+    assert analysis["kpis"]["transactions"] == 3000
+    assert analysis["kpis"]["peeling_chains"] >= 1
+    assert analysis["kpis"]["mixing_rounds"] >= 1
+    assert analysis["alerts"], "expected alerts"
+    assert analysis["graph"]["nodes"], "expected graph nodes"
+    node_types = {n["type"] for n in analysis["graph"]["nodes"]}
+    assert node_types <= {"wallet", "tx", "ip"}
+
+
+def test_analysis_detects_planted_patterns():
+    analysis = _analysis()
+    types = {a["type"] for a in analysis["alerts"]}
+    assert "Peeling chain" in types, "planted peel chain must surface in alerts"
+    assert "Mixing" in types, "planted CoinJoin-like round must surface in alerts"
+    assert analysis["metrics"]["patterns"]["chains_recovered"] >= 1
+    assert analysis["metrics"]["patterns"]["rounds_recovered"] >= 1
+
+
+def test_metrics_computed_against_ground_truth():
+    analysis = _analysis()
+    tx = analysis["metrics"]["transaction"]
+    assert tx["available"] and tx["labelled_rows"] > 0
+    assert tx["roc_auc"] is not None and tx["roc_auc"] > 0.9  # rows are strongly separable
+    for alert in analysis["alerts"]:
+        assert alert["reasons"] and alert["confidence"] > 0

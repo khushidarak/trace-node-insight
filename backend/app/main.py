@@ -1,62 +1,71 @@
 """BitTrace AI FastAPI backend.
 
-Offline analysis service exposing the endpoints the frontend API layer
-expects (README §18):
+Offline analysis service exposing the endpoints the frontend API layer uses:
 
-    POST /api/upload          → ingest CSV/JSON/XML dataset
-    POST /api/analyze         → run the full ML pipeline
-    GET  /api/dashboard       → KPIs, charts, top suspicious entities
-    GET  /api/transactions    → searchable transaction list
+    POST /api/upload           → ingest CSV/JSON/XML dataset
+    POST /api/sample           → load the built-in synthetic dataset
+    POST /api/analyze          → run the full ML pipeline
+    GET  /api/dashboard        → KPIs + chart data
+    GET  /api/transactions     → paginated/searchable transaction list
     GET  /api/transactions/{txid}
-    GET  /api/entities        → scored entities
-    GET  /api/entities/{id}
-    GET  /api/graph           → nodes + edges for link analysis
-    GET  /api/alerts          → prioritized explainable leads
-    GET  /api/clusters        → DBSCAN entity clusters
-    GET  /api/geo             → country-level network context
-    GET  /api/reports         → investigation report payload
-    GET  /api/sample-dataset  → download the synthetic generator output
+    GET  /api/graph            → link-analysis nodes + edges
+    GET  /api/anomalies        → anomaly scores + top contributing features
+    GET  /api/clusters         → entity clusters
+    GET  /api/alerts           → ranked explainable alerts
+    GET  /api/alerts/{id}      → full evidence detail
+    PATCH /api/alerts/{id}     → status update (New/Investigating/Closed)
+    GET  /api/geo              → offline country/ASN aggregation
+    GET  /api/report?format=…  → CSV / JSON / PDF export
+    GET  /api/model-metrics    → precision/recall/F1 vs planted ground truth
+    GET/PUT /api/settings      → pipeline tunables
 
 State is held in-process: one dataset + one analysis at a time, which matches
-the offline single-investigator model of the prototype.
+the offline single-investigator model of the prototype. The built frontend is
+served from disk so a single `./run.sh` runs the whole app offline.
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
+import os
 from datetime import datetime, timezone
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
-from . import pipeline as ml
-from .config import API_VERSION
-from .ingestion import IngestionError, load_upload
-from .synthetic import generate_synthetic_dataset
+from . import orchestrator
+from .config import (
+    API_VERSION, MODEL_NAME, PERSIST_DIR, SETTINGS, AnalysisSettings,
+    load_settings, save_settings,
+)
+from pipeline import ingest
+from pipeline.ingest import IngestionError, load_upload
 
 app = FastAPI(title="BitTrace AI — Bitcoin Forensics Backend", version=API_VERSION)
 
-# The frontend runs on a different port during development.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://localhost:5173", "http://127.0.0.1:8080", "http://127.0.0.1:5173"],
+    allow_origins=["*"],  # offline tool; the UI is served from this same origin
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 STATE: dict = {
-    "dataset": None,        # canonical records
-    "meta": None,           # dataset summary metadata
-    "analysis": None,       # full analysis payload
+    "records": None,       # canonical records list
+    "meta": None,          # dataset summary metadata
+    "analysis": None,      # full analysis payload
 }
 
 
-def _require_dataset() -> pd.DataFrame:
-    if STATE["dataset"] is None:
-        raise HTTPException(409, "No dataset loaded. POST /api/upload first.")
-    return pd.DataFrame(STATE["dataset"])
+def _require_dataset() -> list[dict]:
+    if STATE["records"] is None:
+        raise HTTPException(409, "No dataset loaded. POST /api/upload or /api/sample first.")
+    return STATE["records"]
 
 
 def _require_analysis() -> dict:
@@ -65,320 +74,137 @@ def _require_analysis() -> dict:
     return STATE["analysis"]
 
 
-# ---------------------------------------------------------------------------
-# Pipeline runner
-# ---------------------------------------------------------------------------
-def run_full_analysis(records: list[dict], meta: dict) -> dict:
-    df = pd.DataFrame(records)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-
-    # 1. Transaction-level scoring
-    tx_feats = ml.build_transaction_features(df)
-    tx_scores, tx_contribs = ml.score_frame(tx_feats)
-    df["anomalyScore"] = tx_scores
-
-    # 2. Wallet-level scoring
-    wallet_feats = ml.build_wallet_features(df)
-    wallet_scores, wallet_contribs = ml.score_frame(wallet_feats[ml.WALLET_FEATURES[:-1]])
-
-    # 3. IP-level scoring
-    ip_feats = ml.build_ip_features(df)
-    ip_scores, ip_contribs = ml.score_frame(ip_feats)
-
-    # 4. Graph + risk propagation
-    graph = ml.build_graph(df)
-    seed = {}
-    for txid, score in zip(df["txid"], tx_scores):
-        seed[("tx", txid)] = float(score)
-    for wid, score in zip(wallet_feats.index, wallet_scores):
-        seed[("wallet", wid)] = float(score)
-    for ip, score in zip(ip_feats.index, ip_scores):
-        seed[("ip", ip)] = float(score)
-    risk_by_node = ml.propagate_risk(graph, seed)
-
-    # 5. Cluster wallets (DBSCAN)
-    labels, coords = ml.cluster_wallets(wallet_feats)
-
-    # --- Assemble entity payloads -----------------------------------------
-    tx_rows = []
-    for idx, row in df.iterrows():
-        tx_rows.append({
-            "txid": row["txid"],
-            "timestamp": row["timestamp"].isoformat(),
-            "inputAddresses": row["input_addresses"],
-            "outputAddresses": row["output_addresses"],
-            "inputAmount": round(float(sum(row["input_amounts"])), 6),
-            "outputAmount": round(float(sum(row["output_amounts"])), 6),
-            "fee": round(float(row["fee"]), 2),
-            "scriptType": row["script_type"],
-            "srcIp": row["src_ip"],
-            "dstIp": row["dst_ip"],
-            "srcPort": row["src_port"],
-            "dstPort": row["dst_port"],
-            "country": row["geo_country"],
-            "asn": row["asn"],
-            "riskScore": round(float(tx_scores[idx]), 4),
-            "risk": ml.risk_for(float(tx_scores[idx])),
-            "status": "Flagged" if tx_scores[idx] >= ml.HIGH_THRESHOLD else "Normal",
-            "reasonDetail": ml.top_contributions(tx_contribs, idx, ml.TX_FEATURES),
-        })
-
-    def entity_rows(index, scores, contribs, feature_names, entity_type):
-        rows = []
-        for i, entity_id in enumerate(index):
-            score = float(scores[i])
-            neighbours = [n for n in graph.predecessors((entity_type, entity_id))] + [
-                n for n in graph.successors((entity_type, entity_id))
-            ]
-            evidence = [n[1] for n in neighbours if n[0] == "tx"][:8]
-            rows.append({
-                "id": entity_id,
-                "type": entity_type.capitalize() if entity_type != "ip" else "IP",
-                "riskScore": round(score * 100),
-                "anomalyScore": round(score, 4),
-                "connections": len(neighbours),
-                "reason": ml.top_contributions(contribs, i, feature_names, top=1)[0]["feature"],
-                "reasonDetail": ml.top_contributions(contribs, i, feature_names),
-                "firstSeen": str(df["timestamp"].min().date()),
-                "lastSeen": str(df["timestamp"].max().date()),
-                "evidence": evidence,
-            })
-        return rows
-
-    wallet_rows = entity_rows(wallet_feats.index, wallet_scores, wallet_contribs, ml.WALLET_FEATURES[:-1], "wallet")
-    ip_rows = entity_rows(ip_feats.index, ip_scores, ip_contribs, ml.IP_FEATURES, "ip")
-
-    # 6. Alerts from blended scores
-    scored = {"tx": tx_rows, "wallet": wallet_rows, "ip": ip_rows}
-    alerts = ml.build_alerts(scored, risk_by_node)
-
-    # 7. Clusters
-    clusters = []
-    for label in sorted(set(labels)):
-        if label == -1:
-            continue
-        members = [str(w) for w, l in zip(wallet_feats.index, labels) if l == label]
-        if len(members) < 2:
-            continue
-        ips = set()
-        txs = set()
-        countries = set()
-        for w in members:
-            node = ("wallet", w)
-            for nb in graph.successors(node):
-                if nb[0] == "tx":
-                    txs.add(nb[1])
-        member_set = set(members)
-        for _, row in df.iterrows():
-            if member_set & set(row["input_addresses"]) or member_set & set(row["output_addresses"]):
-                ips.add(row["src_ip"])
-                countries.add(row["geo_country"])
-                txs.add(row["txid"])
-        cluster_scores = [next((e["anomalyScore"] for e in wallet_rows if e["id"] == w), 0.0) for w in members]
-        avg = sum(cluster_scores) / len(cluster_scores)
-        clusters.append({
-            "id": f"Cluster #{len(clusters) + 1:02d}",
-            "wallets": len(members),
-            "ips": len(ips),
-            "transactions": len(txs),
-            "risk": ml.risk_for(avg),
-            "score": round(avg, 4),
-            "signature": ml.top_contributions(wallet_contribs, list(wallet_feats.index).index(members[0]), ml.WALLET_FEATURES[:-1], top=2)[0]["feature"],
-            "countries": sorted(countries)[:4],
-            "members": members,
-        })
-    clusters.sort(key=lambda c: c["score"], reverse=True)
-
-    # 8. Geo summary
-    geo = []
-    for country, sub in df.groupby("geo_country"):
-        geo.append({
-            "country": country,
-            "ips": int(sub["src_ip"].nunique()),
-            "transactions": int(len(sub)),
-            "wallets": int(len(set().union(*sub["input_addresses"]) | set().union(*sub["output_addresses"]))),
-            "risk": ml.risk_for(float(sub["anomalyScore"].mean())),
-        })
-    geo.sort(key=lambda g: g["transactions"], reverse=True)
-
-    # 9. Activity over time
-    daily = df.set_index("timestamp").resample("D").agg(
-        total=("txid", "count"), mean_score=("anomalyScore", "mean")
-    )
-    activity = [
-        {
-            "day": str(day.date()),
-            "normal": int(row["total"] - round(row["total"] * row["mean_score"])),
-            "suspicious": int(round(row["total"] * row["mean_score"])),
-        }
-        for day, row in daily.iterrows()
-    ]
-
-    risk_distribution = [
-        {"name": level, "value": sum(1 for e in wallet_rows + ip_rows if ml.risk_for(e["anomalyScore"]) == level)}
-        for level in ("Low", "Medium", "High", "Critical")
-    ]
-
-    reason_counter: dict[str, int] = {}
-    for alert in alerts:
-        for reason in alert["reasons"]:
-            reason_counter[reason] = reason_counter.get(reason, 0) + 1
-    activity_types = [
-        {"name": name.replace("_", " ").title(), "value": value}
-        for name, value in sorted(reason_counter.items(), key=lambda kv: kv[1], reverse=True)[:7]
-    ]
-
-    # 10. Graph payload (compact: top leads + their transaction neighbourhoods)
-    hot_ids = {("wallet", a["entityId"]) for a in alerts[:16] if a["entityType"] == "Wallet"}
-    hot_ids |= {("ip", a["entityId"]) for a in alerts[:16] if a["entityType"] == "IP"}
-    frontier = set()
-    for node in list(hot_ids)[:32]:
-        frontier |= set(graph.predecessors(node)) | set(graph.successors(node))
-    keep = hot_ids | frontier
-    nodes = []
-    for node in keep:
-        ntype, nid = node
-        nodes.append({
-            "id": nid,
-            "type": {"tx": "Transaction", "wallet": "Wallet", "ip": "IP"}.get(ntype, nid),
-            "risk": ml.risk_for(risk_by_node.get(node, 0.0)),
-            "score": round(float(risk_by_node.get(node, 0.0)), 4),
-        })
-    node_keys = {n["id"] for n in nodes}
-    edges = []
-    for src, dst, data in graph.edges(data=True):
-        if src[1] in node_keys and dst[1] in node_keys:
-            edges.append({"source": src[1], "target": dst[1], "kind": data.get("kind", "")})
-
-    analysis = {
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "summary": meta,
-        "kpis": {
-            "totalTransactions": len(df),
-            "walletEntities": len(wallet_feats),
-            "networkIps": len(ip_feats),
-            "suspiciousEntities": sum(1 for e in wallet_rows + ip_rows if e["anomalyScore"] >= ml.MEDIUM_THRESHOLD),
-            "highRiskAlerts": sum(1 for a in alerts if a["risk"] in ("High", "Critical")),
-            "avgAnomalyScore": round(float(df["anomalyScore"].mean()), 4),
-        },
-        "model": {
-            "name": "Isolation Forest",
-            "clustering": "DBSCAN",
-            "features": ml.TX_FEATURES + ml.WALLET_FEATURES[:-1] + ml.IP_FEATURES,
-        },
-        "transactions": tx_rows,
-        "entities": wallet_rows + ip_rows,
-        "alerts": alerts,
-        "clusters": clusters,
-        "geo": geo,
-        "activity": activity,
-        "riskDistribution": risk_distribution,
-        "activityTypes": activity_types,
-        "graph": {"nodes": nodes, "edges": edges},
-    }
-    return analysis
+def load_records(records: list[dict], rejection_reasons: list[str],
+                 detected: list[str], name: str, file_type: str) -> dict:
+    """Install a parsed dataset into STATE and return the summary."""
+    STATE["records"] = records
+    STATE["analysis"] = None  # stale analysis
+    meta = orchestrator.summarize_dataset(records, rejection_reasons, name, file_type, detected)
+    STATE["meta"] = meta
+    return meta
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Ingestion
 # ---------------------------------------------------------------------------
-@app.get("/api/health")
-def health():
-    return {
-        "status": "ok",
-        "version": API_VERSION,
-        "datasetLoaded": STATE["dataset"] is not None,
-        "analysisReady": STATE["analysis"] is not None,
-    }
-
-
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)):
     payload = await file.read()
     try:
-        records, rejected, missing, file_type = load_upload(file.filename or "dataset.csv", payload)
+        records, reasons, detected, file_type = load_upload(file.filename or "dataset.csv", payload)
     except IngestionError as exc:
         raise HTTPException(422, str(exc)) from exc
+    meta = load_records(records, reasons, detected, file.filename or "dataset.csv", file_type)
+    return {"status": "ingested", "summary": meta, "preview": records[:3]}
 
-    STATE["dataset"] = records
-    STATE["analysis"] = None  # stale analysis
-    timestamps = [r["timestamp"] for r in records]
-    wallets = set()
-    ips = set()
-    for r in records:
-        wallets.update(r["input_addresses"])
-        wallets.update(r["output_addresses"])
-        ips.add(r["src_ip"])
-        ips.add(r["dst_ip"])
-    STATE["meta"] = {
-        "fileName": file.filename,
-        "fileType": file_type,
-        "records": len(records),
-        "wallets": len(wallets),
-        "transactions": len({r["txid"] for r in records}),
-        "ips": len(ips),
-        "dateRange": [min(timestamps), max(timestamps)],
-        "rejectedRecords": rejected,
-        "missingFields": missing,
-    }
-    return {"status": "ingested", **STATE["meta"]}
+
+def _project_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+@app.post("/api/sample")
+def sample(rows: int = 5000):
+    """Generate + load the built-in synthetic dataset (with ground truth)."""
+    import sys
+
+    sys.path.insert(0, os.path.join(_project_root(), "backend"))
+    from generate_data import Generator
+
+    gen = Generator(rows=min(max(rows, 100), 50000), seed=42)
+    raw_records, labels, planted = gen.generate()
+    # attach ground truth so /api/model-metrics has something to score against
+    for rec, label in zip(raw_records, labels):
+        rec["ground_truth"] = label
+    # normalise through the real ingest path (validates the generator output too)
+    records, reasons = ingest.parse_records(raw_records)
+    detected = ingest.detected_fields(raw_records[:50])
+    meta = load_records(records, reasons, detected, f"synthetic_sample_{len(records)}", "synthetic")
+    # keep the generator's planted facts for the pattern-recovery metrics
+    meta["planted_patterns"] = planted
+    return {"status": "loaded", "summary": meta, "preview": records[:3]}
 
 
 @app.post("/api/analyze")
 def analyze():
-    if STATE["dataset"] is None:
-        raise HTTPException(409, "No dataset loaded. POST /api/upload first.")
-    analysis = run_full_analysis(STATE["dataset"], STATE["meta"])
+    records = _require_dataset()
+    analysis = orchestrator.run_analysis(records, STATE["meta"] or {})
     STATE["analysis"] = analysis
     return {
         "status": "complete",
-        "records": analysis["summary"]["records"],
+        "records": analysis["dataset"]["rows_parsed"],
         "alerts": len(analysis["alerts"]),
         "clusters": len(analysis["clusters"]),
-        "suspiciousEntities": analysis["kpis"]["suspiciousEntities"],
+        "peeling_chains": analysis["kpis"]["peeling_chains"],
+        "mixing_rounds": analysis["kpis"]["mixing_rounds"],
+        "flagged_entities": analysis["kpis"]["flagged_entities"],
+        "elapsed_ms": analysis["generated_at"],
     }
 
 
+# ---------------------------------------------------------------------------
+# Read endpoints
+# ---------------------------------------------------------------------------
 @app.get("/api/dashboard")
 def dashboard():
     a = _require_analysis()
     return {
-        "summary": a["summary"],
+        "dataset": a["dataset"],
         "kpis": a["kpis"],
-        "activity": a["activity"],
-        "riskDistribution": a["riskDistribution"],
-        "activityTypes": a["activityTypes"],
-        "topEntities": sorted(a["entities"], key=lambda e: e["anomalyScore"], reverse=True)[:10],
-        "recentAlerts": a["alerts"][:10],
         "model": a["model"],
+        "metrics": a["metrics"],
+        "charts": a["charts"],
+        "top_wallets": sorted(a["wallets"], key=lambda w: -(w["anomaly_score"] + w["risk_score"] / 100))[:8],
+        "recent_alerts": a["alerts"][:8],
+        "mini_graph": {"nodes": a["graph"]["nodes"][:80], "edges": a["graph"]["edges"][:200]},
+        "generated_at": a["generated_at"],
     }
 
 
-@app.get("/api/dashboard-full")
-def dashboard_full():
-    """Complete analysis payload in one response (used right after analyze)."""
+@app.get("/api/analysis")
+def full_analysis():
+    """Complete analysis payload in one response."""
     return _require_analysis()
 
 
 @app.get("/api/transactions")
 def transactions(
-    q: str = "", risk: str = "", country: str = "", asn: str = "",
-    limit: int = 100, offset: int = 0,
+    q: str = "",
+    risk: str = "",
+    country: str = "",
+    flagged: bool = False,
+    min_amount: float | None = None,
+    max_amount: float | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     a = _require_analysis()
     rows = a["transactions"]
     if q:
         needle = q.lower()
-        rows = [r for r in rows if needle in r["txid"].lower()
-                or any(needle in w.lower() for w in r["inputAddresses"] + r["outputAddresses"])
-                or needle in r["srcIp"].lower() or needle in r["dstIp"].lower() or needle in r["asn"].lower()]
+        rows = [
+            r for r in rows
+            if needle in r["txid"].lower()
+            or any(needle in w.lower() for w in r["input_addresses"] + r["output_addresses"])
+            or needle in r["src_ip"].lower()
+            or needle in r["dst_ip"].lower()
+            or needle in r["asn"].lower()
+            or needle in r["country"].lower()
+        ]
     if risk:
         rows = [r for r in rows if r["risk"].lower() == risk.lower()]
     if country:
         rows = [r for r in rows if r["country"].lower() == country.lower()]
-    if asn:
-        rows = [r for r in rows if r["asn"].lower() == asn.lower()]
-    return {"total": len(rows), "items": rows[offset:offset + limit]}
+    if flagged:
+        rows = [r for r in rows if r["flagged"]]
+    if min_amount is not None:
+        rows = [r for r in rows if r["output_amount"] >= min_amount]
+    if max_amount is not None:
+        rows = [r for r in rows if r["output_amount"] <= max_amount]
+    return {
+        "total": len(rows),
+        "items": rows[offset: offset + limit],
+        "countries": sorted({r["country"] for r in a["transactions"]}),
+    }
 
 
 @app.get("/api/transactions/{txid}")
@@ -386,60 +212,77 @@ def transaction_detail(txid: str):
     a = _require_analysis()
     for row in a["transactions"]:
         if row["txid"] == txid:
-            return row
+            related = [
+                x for x in a["transactions"]
+                if x["txid"] != txid and (
+                    set(x["input_addresses"]) & set(row["input_addresses"] + row["output_addresses"])
+                    or set(x["output_addresses"]) & set(row["output_addresses"])
+                )
+            ][:10]
+            related_alerts = [
+                al for al in a["alerts"]
+                if txid in al["evidence"].get("txids", [])
+            ]
+            return {**row, "related_transactions": related, "related_alerts": related_alerts}
     raise HTTPException(404, f"transaction {txid} not found")
 
 
-@app.get("/api/entities")
-def entities(type: str = "", q: str = "", limit: int = 200, offset: int = 0):
-    a = _require_analysis()
-    rows = a["entities"]
-    if type:
-        rows = [r for r in rows if r["type"].lower() == type.lower()]
-    if q:
-        needle = q.lower()
-        rows = [r for r in rows if needle in r["id"].lower()]
-    rows = sorted(rows, key=lambda r: r["anomalyScore"], reverse=True)
-    return {"total": len(rows), "items": rows[offset:offset + limit]}
-
-
-@app.get("/api/entities/{entity_id:path}")
-def entity_detail(entity_id: str):
-    a = _require_analysis()
-    for row in a["entities"]:
-        if row["id"] == entity_id:
-            return row
-    raise HTTPException(404, f"entity {entity_id} not found")
-
-
 @app.get("/api/graph")
-def graph(limit: int = 400):
+def graph(
+    risk_min: float = 0.0,
+    cluster: str = "",
+    node_type: str = "",
+    q: str = "",
+    limit: int = Query(400, ge=20, le=2000),
+):
     a = _require_analysis()
     nodes, edges = a["graph"]["nodes"], a["graph"]["edges"]
-    return {"nodes": nodes[:limit], "edges": [e for e in edges if e["source"] in {n["id"] for n in nodes[:limit]} and e["target"] in {n["id"] for n in nodes[:limit]}]}
+    if q:
+        needle = q.lower()
+        nodes = [n for n in nodes if needle in n["id"].lower()]
+    if cluster:
+        nodes = [n for n in nodes if n.get("cluster") == cluster]
+    if node_type:
+        nodes = [n for n in nodes if n["type"] == node_type]
+    nodes = [n for n in nodes if n["score"] >= risk_min][:limit]
+    keep = {n["id"] for n in nodes}
+    edges = [e for e in edges if e["source"] in keep and e["target"] in keep]
+    return {"nodes": nodes, "edges": edges, "total_available": len(a["graph"]["nodes"])}
 
 
-@app.get("/api/alerts")
-def alerts(status: str = "", risk: str = "", limit: int = 100):
+@app.get("/api/anomalies")
+def anomalies(
+    entity_type: str = "wallet",
+    limit: int = Query(100, ge=1, le=1000),
+):
     a = _require_analysis()
-    rows = a["alerts"]
-    if status:
-        rows = [r for r in rows if r["status"].lower() == status.lower()]
-    if risk:
-        rows = [r for r in rows if r["risk"].lower() == risk.lower()]
-    return {"total": len(rows), "items": rows[:limit]}
-
-
-@app.patch("/api/alerts/{alert_id}")
-def update_alert(alert_id: str, status: str):
-    a = _require_analysis()
-    for row in a["alerts"]:
-        if row["id"] == alert_id:
-            if status not in ("New", "Investigating", "Reviewed", "Dismissed"):
-                raise HTTPException(422, "invalid status")
-            row["status"] = status
-            return row
-    raise HTTPException(404, f"alert {alert_id} not found")
+    if entity_type == "transaction":
+        items = sorted(a["transactions"], key=lambda r: -r["anomaly_score"])
+        return {
+            "entity_type": "transaction",
+            "model": a["model"],
+            "items": [
+                {
+                    "id": r["txid"], "timestamp": r["timestamp"],
+                    "anomaly_score": r["anomaly_score"], "risk": r["risk"],
+                    "contributions": r["contributions"],
+                } for r in items[:limit]
+            ],
+            "score_distribution": a["charts"]["score_distribution"],
+        }
+    items = sorted(a["wallets"], key=lambda w: -w["anomaly_score"])
+    return {
+        "entity_type": "wallet",
+        "model": a["model"],
+        "items": [
+            {
+                "id": w["id"], "anomaly_score": w["anomaly_score"], "risk": w["risk"],
+                "risk_score": w["risk_score"], "seed": w["seed"],
+                "contributions": w["contributions"], "tx_count": w["tx_count"],
+            } for w in items[:limit]
+        ],
+        "score_distribution": a["charts"]["score_distribution"],
+    }
 
 
 @app.get("/api/clusters")
@@ -448,51 +291,239 @@ def clusters():
     return {"total": len(a["clusters"]), "items": a["clusters"]}
 
 
+@app.get("/api/alerts")
+def alerts_list(status: str = "", risk: str = "", type_: str = Query("", alias="type")):
+    a = _require_analysis()
+    rows = a["alerts"]
+    if status:
+        rows = [r for r in rows if r["status"].lower() == status.lower()]
+    if risk:
+        rows = [r for r in rows if r["risk"].lower() == risk.lower()]
+    if type_:
+        rows = [r for r in rows if r["type"].lower() == type_.lower()]
+    return {"total": len(rows), "items": rows}
+
+
+@app.get("/api/alerts/{alert_id}")
+def alert_detail(alert_id: str):
+    a = _require_analysis()
+    for row in a["alerts"]:
+        if row["id"] == alert_id:
+            txids = row["evidence"].get("txids", [])[:8]
+            detail_txs = [t for t in a["transactions"] if t["txid"] in txids]
+            return {**row, "evidence_transactions": detail_txs}
+    raise HTTPException(404, f"alert {alert_id} not found")
+
+
+@app.patch("/api/alerts/{alert_id}")
+def alert_status(alert_id: str, status: str = Query(...)):
+    a = _require_analysis()
+    allowed = {"New", "Investigating", "Closed"}
+    if status not in allowed:
+        raise HTTPException(422, f"status must be one of {sorted(allowed)}")
+    for row in a["alerts"]:
+        if row["id"] == alert_id:
+            row["status"] = status
+            orchestrator._persist(a)
+            return row
+    raise HTTPException(404, f"alert {alert_id} not found")
+
+
 @app.get("/api/geo")
 def geo():
-    return _require_analysis()["geo"]
-
-
-@app.get("/api/reports")
-def reports():
     a = _require_analysis()
-    kpis, alerts_ = a["kpis"], a["alerts"]
+    return {"items": a["geo"], "source": "offline: dataset geo_country/asn fields (no external GeoIP)"}
+
+
+@app.get("/api/model-metrics")
+def model_metrics():
+    a = _require_analysis()
     return {
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "datasetSummary": a["summary"],
-        "model": a["model"],
-        "kpis": kpis,
-        "alertStatistics": {
-            "total": len(alerts_),
-            "critical": sum(1 for x in alerts_ if x["risk"] == "Critical"),
-            "high": sum(1 for x in alerts_ if x["risk"] == "High"),
-            "medium": sum(1 for x in alerts_ if x["risk"] == "Medium"),
-            "low": sum(1 for x in alerts_ if x["risk"] == "Low"),
+        "model": {
+            "name": MODEL_NAME,
+            "params": a["model"]["params"],
+            "features": a["model"]["features"],
+            "explainer": a["model"]["explainer"],
+            "clustering": a["model"]["clustering"],
+            "risk_propagation": a["model"]["risk_propagation"],
+            "comparison": a["model"].get("comparison"),
         },
-        "topLeads": alerts_[:10],
-        "clusters": a["clusters"][:6],
-        "geo": a["geo"][:10],
-        "limitations": [
-            "Scores are investigative prioritisation signals, not proof of criminal activity.",
-            "Synthetic dataset — generated locally, no live blockchain data involved.",
-            "Unsupervised models (Isolation Forest, DBSCAN) may flag rare-but-benign behaviour.",
-            "Country-level metadata provides context only; a country is never 'suspicious'.",
-        ],
+        "transaction": a["metrics"]["transaction"],
+        "wallet": a["metrics"]["wallet"],
+        "patterns": a["metrics"]["patterns"],
+        "dataset": a["dataset"],
     }
 
 
-@app.get("/api/sample-dataset")
-def sample_dataset(records: int = 1200):
-    """Download a synthetic dataset (CSV) matching the required schema."""
-    rows = generate_synthetic_dataset(min(max(records, 100), 20_000))
-    df = pd.DataFrame(rows)
-    df["input_addresses"] = df["input_addresses"].apply(lambda v: ";".join(v))
-    df["output_addresses"] = df["output_addresses"].apply(lambda v: ";".join(v))
-    df["input_amounts"] = df["input_amounts"].apply(lambda v: ";".join(str(x) for x in v))
-    df["output_amounts"] = df["output_amounts"].apply(lambda v: ";".join(str(x) for x in v))
-    csv_text = df.to_csv(index=False)
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+@app.get("/api/settings")
+def get_settings():
+    return {k: getattr(SETTINGS, k) for k in (
+        "contamination", "risk_propagation_decay", "peeling_min_hops",
+        "mixing_min_outputs", "dbscan_eps", "dbscan_min_samples",
+        "risk_high_threshold", "risk_critical_threshold")}
+
+
+@app.put("/api/settings")
+async def put_settings(payload: dict):
+    global SETTINGS
+    current = {k: getattr(SETTINGS, k) for k in (
+        "contamination", "risk_propagation_decay", "peeling_min_hops",
+        "mixing_min_outputs", "dbscan_eps", "dbscan_min_samples",
+        "risk_high_threshold", "risk_critical_threshold")}
+    try:
+        SETTINGS = AnalysisSettings(**{**current, **payload}).normalized()
+    except TypeError as exc:
+        raise HTTPException(422, f"invalid setting key: {exc}") from exc
+    save_settings(SETTINGS)
+    return get_settings()
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+@app.get("/api/report")
+def report(format: str = Query("json", pattern="^(csv|json|pdf)$")):
+    a = _require_analysis()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "alert_id", "entity_type", "entity_id", "type", "risk_score", "confidence",
+            "status", "reasons", "evidence_txids", "evidence_ips",
+        ])
+        for al in a["alerts"]:
+            writer.writerow([
+                al["id"], al["entity"]["type"], al["entity"]["id"], al["type"],
+                al["risk_score"], al["confidence"], al["status"],
+                " | ".join(al["reasons"]),
+                " ".join(al["evidence"].get("txids", [])[:6]),
+                " ".join(al["evidence"].get("ips", [])[:4]),
+            ])
+        return Response(
+            content=buf.getvalue(), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="bittrace_alerts_{stamp}.csv"'},
+        )
+    if format == "json":
+        payload = {
+            "generated_at": a["generated_at"],
+            "dataset": a["dataset"],
+            "kpis": a["kpis"],
+            "model": a["model"],
+            "metrics": a["metrics"],
+            "alerts": a["alerts"],
+            "top_wallets": a["wallets"][:20],
+            "clusters": a["clusters"][:12],
+            "geo": a["geo"][:12],
+            "limitations": [
+                "Scores are investigative prioritisation signals, not proof of criminal activity.",
+                "Synthetic dataset — generated locally, no live blockchain data involved.",
+                "Unsupervised models (IsolationForest, DBSCAN) may flag rare-but-benign behaviour.",
+                "Country-level metadata provides context only; a country is never 'suspicious'.",
+            ],
+        }
+        return JSONResponse(payload, headers={
+            "Content-Disposition": f'attachment; filename="bittrace_report_{stamp}.json"'})
+
+    # PDF via reportlab (graceful message if the optional dep is missing)
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError:
+        raise HTTPException(501, "PDF export requires the 'reportlab' package (pip install reportlab)")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, title="BitTrace AI — Investigation Report")
+    styles = getSampleStyleSheet()
+    flow = []
+    flow.append(Paragraph("<b>BitTrace AI — Bitcoin Forensics Console</b>", styles["Title"]))
+    flow.append(Paragraph("Investigation Report — generated offline", styles["Normal"]))
+    flow.append(Spacer(1, 6 * mm))
+    ds, k = a["dataset"], a["kpis"]
+    flow.append(Paragraph(
+        f"Dataset: {ds.get('name', '—')} ({ds.get('file_type', '').upper()}) · "
+        f"{ds.get('rows_parsed', 0):,} rows parsed · {ds.get('rows_rejected', 0)} rejected<br/>"
+        f"Time range: {ds.get('time_range', ['—', '—'])[0]} → {ds.get('time_range', ['—', '—'])[1]}<br/>"
+        f"Transactions {k['transactions']:,} · Wallets {k['wallets']:,} · IPs {k['ips']:,} · "
+        f"Clusters {k['clusters']} · Flagged entities {k['flagged_entities']} · "
+        f"High-risk alerts {k['high_risk_alerts']}",
+        styles["Normal"]))
+    flow.append(Spacer(1, 4 * mm))
+    m = a["metrics"]
+    flow.append(Paragraph(
+        f"Model: {MODEL_NAME} (contamination={a['model']['params']['contamination']}) · "
+        f"Precision {m['transaction'].get('precision', 'n/a')} · Recall {m['transaction'].get('recall', 'n/a')} · "
+        f"F1 {m['transaction'].get('f1', 'n/a')} · ROC-AUC {m['transaction'].get('roc_auc', 'n/a')}",
+        styles["Normal"]))
+    flow.append(Spacer(1, 6 * mm))
+    flow.append(Paragraph("<b>Top investigation leads</b>", styles["Heading2"]))
+    table_data = [["Alert", "Entity", "Type", "Risk", "Conf.", "Reasons"]]
+    for al in a["alerts"][:15]:
+        table_data.append([
+            al["id"], al["entity"]["id"][:22] + "…", al["type"], str(al["risk_score"]),
+            f"{al['confidence']:.2f}", al["reasons"][0][:70] if al["reasons"] else "",
+        ])
+    table = Table(table_data, colWidths=[18 * mm, 52 * mm, 24 * mm, 14 * mm, 14 * mm, 58 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#134e4a")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    flow.append(table)
+    flow.append(Spacer(1, 6 * mm))
+    flow.append(Paragraph(
+        "<b>Limitations:</b> prioritisation signals only; synthetic dataset; unsupervised models "
+        "can flag rare-but-benign behaviour; country metadata is context, never a verdict.",
+        styles["Normal"]))
+    doc.build(flow)
     return Response(
-        content=csv_text,
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=bitcoin_network_metadata.csv"},
+        content=buf.getvalue(), media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="bittrace_report_{stamp}.pdf"'},
     )
+
+
+@app.get("/api/report/preview")
+def report_preview():
+    """HTML preview of the report payload (used by the Reports page)."""
+    a = _require_analysis()
+    return {"generated_at": a["generated_at"], "dataset": a["dataset"], "kpis": a["kpis"],
+            "metrics": a["metrics"], "model": a["model"], "alerts": a["alerts"][:10]}
+
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "version": API_VERSION,
+        "dataset_loaded": STATE["records"] is not None,
+        "analysis_ready": STATE["analysis"] is not None,
+        "dataset_name": (STATE["meta"] or {}).get("name"),
+        "offline": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Static frontend (built by build.sh into frontend-dist/) — keeps deployment to
+# a single uvicorn process with zero external network access.
+# ---------------------------------------------------------------------------
+_STATIC = os.path.join(_project_root(), "frontend-dist")
+if os.path.isdir(_STATIC):
+    app.mount("/", StaticFiles(directory=_STATIC, html=True), name="frontend")
+else:  # dev fallback: the Vite dev server runs separately
+    @app.get("/")
+    def index() -> HTMLResponse:
+        return HTMLResponse(
+            "<html><body style='font-family:monospace;background:#0b0e16;color:#cbd5e1'>"
+            "<h2>BitTrace AI backend is running.</h2>"
+            "<p>API docs: <a href='/docs' style='color:#22d3ee'>/docs</a> · "
+            "Start the frontend with <code>./dev.sh</code> or build it with "
+            "<code>./build.sh</code> and restart.</p></body></html>"
+        )

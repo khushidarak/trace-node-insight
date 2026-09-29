@@ -8,8 +8,10 @@ import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 export default defineConfig({
   tanstackStart: {
-    // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
-    // nitro/vite builds from this
+    // SPA mode: prerender the shell to a static index.html so the FastAPI
+    // backend can serve the whole app as plain files (fully offline, no SSR
+    // server required). clientServerCodeRemoval strips server-only imports.
+    spa: { enabled: true },
     server: { entry: "server" },
   },
 });
