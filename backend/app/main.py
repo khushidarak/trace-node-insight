@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -349,8 +350,8 @@ async def upload(file: UploadFile = File(...)):
         ],
     }
 
-    # CRITICAL FIX: Automatically run analysis pipeline on upload
-    analysis = run_full_analysis(STATE["dataset"], STATE["meta"])
+    # CRITICAL FIX: Offload CPU-bound ML pipeline execution to a threadpool
+    analysis = await run_in_threadpool(run_full_analysis, STATE["dataset"], STATE["meta"])
     STATE["analysis"] = analysis
 
     return {
@@ -358,9 +359,6 @@ async def upload(file: UploadFile = File(...)):
         "summary": STATE["meta"],
         "analysisReady": True
     }
-
-
-
 
 @app.post("/api/analyze")
 def analyze():
