@@ -1,4 +1,4 @@
-"""BitTrace AI FastAPI backend.
+-"""BitTrace AI FastAPI backend.
 
 Offline analysis service exposing the endpoints the frontend API layer
 expects (README §18):
@@ -315,7 +315,6 @@ async def upload(file: UploadFile = File(...)):
         raise HTTPException(422, str(exc)) from exc
 
     STATE["dataset"] = records
-    STATE["analysis"] = None  # stale analysis
     timestamps = [r["timestamp"] for r in records]
     wallets = set()
     ips = set()
@@ -323,6 +322,7 @@ async def upload(file: UploadFile = File(...)):
         wallets.update(r["input_addresses"])
         wallets.update(r["output_addresses"])
         ips.update(ip for ip in (r["src_ip"], r["dst_ip"]) if ip)
+        
     STATE["meta"] = {
         "fileName": file.filename,
         "fileType": file_type,
@@ -348,7 +348,18 @@ async def upload(file: UploadFile = File(...)):
             for row in records[:3]
         ],
     }
-    return {"status": "ingested", **STATE["meta"]}
+
+    # CRITICAL FIX: Automatically run analysis pipeline on upload
+    analysis = run_full_analysis(STATE["dataset"], STATE["meta"])
+    STATE["analysis"] = analysis
+
+    return {
+        "status": "ingested", 
+        "summary": STATE["meta"],
+        "analysisReady": True
+    }
+
+
 
 
 @app.post("/api/analyze")
