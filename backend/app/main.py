@@ -3,10 +3,10 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
--"""BitTrace AI FastAPI backend.
+"""BitTrace AI FastAPI backend.
 
 Offline analysis service exposing the endpoints the frontend API layer
-expects (README §18):
+expects:
 
     POST /api/upload          → ingest CSV/JSON/XML dataset
     POST /api/analyze         → run the full ML pipeline
@@ -35,7 +35,8 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from . import pipeline as ml
 from .config import API_VERSION
@@ -328,7 +329,7 @@ async def upload(file: UploadFile = File(...)):
         wallets.update(r["input_addresses"])
         wallets.update(r["output_addresses"])
         ips.update(ip for ip in (r["src_ip"], r["dst_ip"]) if ip)
-         
+
     STATE["meta"] = {
         "fileName": file.filename,
         "fileType": file_type,
@@ -354,12 +355,11 @@ async def upload(file: UploadFile = File(...)):
             for row in records[:3]
         ],
     }
-    
-    # Reset analysis state until /api/analyze is explicitly called by the frontend
+
     STATE["analysis"] = None
 
     return {
-        "status": "ingested", 
+        "status": "ingested",
         "summary": STATE["meta"],
         "analysisReady": False
     }
@@ -397,7 +397,6 @@ def dashboard():
 
 @app.get("/api/dashboard-full")
 def dashboard_full():
-    """Complete analysis payload in one response (used right after analyze)."""
     return _require_analysis()
 
 
@@ -524,7 +523,6 @@ def reports():
 
 @app.get("/api/sample-dataset")
 def sample_dataset(records: int = 1200):
-    """Download a synthetic dataset (CSV) matching the required schema."""
     rows = generate_synthetic_dataset(min(max(records, 100), 20_000))
     df = pd.DataFrame(rows)
     df["input_addresses"] = df["input_addresses"].apply(lambda v: ";".join(v))
@@ -539,25 +537,23 @@ def sample_dataset(records: int = 1200):
     )
 
 
-
-
-
-# --- Keep all your existing API routes here ---
-# app.include_router(...)
-
-# --- Add this at the bottom for local frontend serving ---
-static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../static"))
+# ---------------------------------------------------------------------------
+# Static File Serving for Offline React Frontend
+# ---------------------------------------------------------------------------
+static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../static"))
 
 if os.path.exists(static_dir):
-    # Mount asset folder if it exists
     assets_dir = os.path.join(static_dir, "assets")
     if os.path.exists(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-    # Serve index.html for root and SPA client routes
     @app.get("/{full_path:path}")
     async def serve_react_app(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail=f"API endpoint '/{full_path}' not found")
+
         file_path = os.path.join(static_dir, full_path)
         if os.path.exists(file_path) and os.path.isfile(file_path):
             return FileResponse(file_path)
+
         return FileResponse(os.path.join(static_dir, "index.html"))
