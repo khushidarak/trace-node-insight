@@ -540,7 +540,11 @@ def sample_dataset(records: int = 1200):
 # ---------------------------------------------------------------------------
 # Static File Serving for Offline React Frontend
 # ---------------------------------------------------------------------------
+base_dir = os.path.dirname(__file__)
 static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../static"))
+
+if not os.path.exists(static_dir):
+    static_dir = os.path.abspath(os.path.join(base_dir, "../static"))
 
 if os.path.exists(static_dir):
     assets_dir = os.path.join(static_dir, "assets")
@@ -556,4 +560,8 @@ if os.path.exists(static_dir):
         if os.path.exists(file_path) and os.path.isfile(file_path):
             return FileResponse(file_path)
 
-        return FileResponse(os.path.join(static_dir, "index.html"))
+        index_file = os.path.join(static_dir, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+            
+        raise HTTPException(status_code=404, detail="Frontend static files (index.html) not found in static directory.")
