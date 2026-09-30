@@ -1,9 +1,10 @@
+from __future__ import annotations
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
--"""BitTrace AI FastAPI backend.
+"""BitTrace AI FastAPI backend.
 
 Offline analysis service exposing the endpoints the frontend API layer
 expects (README §18):
@@ -26,7 +27,6 @@ State is held in-process: one dataset + one analysis at a time, which matches
 the offline single-investigator model of the prototype.
 """
 
-from __future__ import annotations
 
 import json
 from datetime import datetime, timezone

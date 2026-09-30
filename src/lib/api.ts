@@ -160,6 +160,19 @@ export async function runAnalysis(live: Live): Promise<Live> {
 
 export async function fetchDashboard(live: Live): Promise<AnalysisData> {
   if (live.data) return live.data;
+if (await isBackendAvailable()) {
+
+    try {
+
+      return await getJson<AnalysisData>("/api/dashboard-full");
+
+    } catch {
+
+      // Fall back to synthetic data only if the backend has no dashboard yet.
+
+    }
+
+  }
   return mockAnalysisData();
 }
 
